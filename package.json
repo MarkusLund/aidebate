@@ -1,7 +1,7 @@
 {
   "name": "aidebate",
-  "version": "1.2.0",
-  "description": "AI debate simulation between Claude and Codex",
+  "version": "1.3.0",
+  "description": "AI debate simulation between Claude, Codex, and Gemini",
   "bin": {
     "aidebate": "./ai-debate.sh"
   },
@@ -14,6 +14,7 @@
     "ai",
     "debate",
     "claude",
-    "codex"
+    "codex",
+    "gemini"
   ]
 }

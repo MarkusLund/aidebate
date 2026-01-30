@@ -2,12 +2,13 @@
 set -euo pipefail
 
 # Detect available tools
-HAS_CLAUDE=false; HAS_CODEX=false
+HAS_CLAUDE=false; HAS_CODEX=false; HAS_GEMINI=false
 command -v claude >/dev/null 2>&1 && HAS_CLAUDE=true
 command -v codex >/dev/null 2>&1 && HAS_CODEX=true
+command -v gemini >/dev/null 2>&1 && HAS_GEMINI=true
 command -v jq >/dev/null 2>&1 || { echo "Feil: 'jq' ikke funnet i PATH"; exit 1; }
-if ! $HAS_CLAUDE && ! $HAS_CODEX; then
-  echo "Feil: Verken 'claude' eller 'codex' funnet i PATH"; exit 1
+if ! $HAS_CLAUDE && ! $HAS_CODEX && ! $HAS_GEMINI; then
+  echo "Feil: Ingen AI-verktøy funnet ('claude', 'codex', eller 'gemini')"; exit 1
 fi
 
 # Determine agent assignments
@@ -15,16 +16,29 @@ if $HAS_CLAUDE && $HAS_CODEX; then
   AGENT_A_CMD=claude; AGENT_B_CMD=codex
   AGENT_A_NAME="Claude"; AGENT_B_NAME="Codex"
   AGENT_A_COLOR='\033[1;34m'; AGENT_B_COLOR='\033[1;32m'
+elif $HAS_CLAUDE && $HAS_GEMINI; then
+  AGENT_A_CMD=claude; AGENT_B_CMD=gemini
+  AGENT_A_NAME="Claude"; AGENT_B_NAME="Gemini"
+  AGENT_A_COLOR='\033[1;34m'; AGENT_B_COLOR='\033[1;35m'
+elif $HAS_CODEX && $HAS_GEMINI; then
+  AGENT_A_CMD=codex; AGENT_B_CMD=gemini
+  AGENT_A_NAME="Codex"; AGENT_B_NAME="Gemini"
+  AGENT_A_COLOR='\033[1;32m'; AGENT_B_COLOR='\033[1;35m'
 elif $HAS_CLAUDE; then
-  echo "Advarsel: 'codex' ikke funnet. Bruker claude for begge agenter."
+  echo "Advarsel: Bare 'claude' funnet. Bruker claude for begge agenter."
   AGENT_A_CMD=claude; AGENT_B_CMD=claude
   AGENT_A_NAME="Claude (1)"; AGENT_B_NAME="Claude (2)"
   AGENT_A_COLOR='\033[1;34m'; AGENT_B_COLOR='\033[1;36m'
-else
-  echo "Advarsel: 'claude' ikke funnet. Bruker codex for begge agenter."
+elif $HAS_CODEX; then
+  echo "Advarsel: Bare 'codex' funnet. Bruker codex for begge agenter."
   AGENT_A_CMD=codex; AGENT_B_CMD=codex
   AGENT_A_NAME="Codex (1)"; AGENT_B_NAME="Codex (2)"
   AGENT_A_COLOR='\033[1;32m'; AGENT_B_COLOR='\033[1;36m'
+else
+  echo "Advarsel: Bare 'gemini' funnet. Bruker gemini for begge agenter."
+  AGENT_A_CMD=gemini; AGENT_B_CMD=gemini
+  AGENT_A_NAME="Gemini (1)"; AGENT_B_NAME="Gemini (2)"
+  AGENT_A_COLOR='\033[1;35m'; AGENT_B_COLOR='\033[1;36m'
 fi
 
 # macOS doesn't have timeout by default (coreutils provides gtimeout)
@@ -49,8 +63,10 @@ run_with_timeout() {
 
 CLAUDE_MODELS=("haiku" "sonnet" "opus")
 CODEX_MODELS=("gpt-5.1-codex-mini" "gpt-5.2-codex")
+GEMINI_MODELS=("gemini-2.5-flash" "gemini-3-flash-preview")
 CLAUDE_MODEL=""
 CODEX_MODEL=""
+GEMINI_MODEL=""
 
 MAX_MESSAGES=10
 API_TIMEOUT=60
@@ -76,6 +92,8 @@ while [[ $# -gt 0 ]]; do
       CLAUDE_MODEL="$2"; shift 2 ;;
     --codex-model)
       CODEX_MODEL="$2"; shift 2 ;;
+    --gemini-model)
+      GEMINI_MODEL="$2"; shift 2 ;;
     --debug)
       DEBUG=true; shift ;;
     --help|-h)
@@ -86,6 +104,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --timeout N             API timeout i sekunder (default: 60)"
       echo "  --claude-model MODEL    Claude-modell (haiku, sonnet, opus)"
       echo "  --codex-model MODEL     Codex-modell (gpt-5.1-codex-mini, gpt-5.2-codex)"
+      echo "  --gemini-model MODEL    Gemini-modell (gemini-2.5-flash, gemini-3-flash-preview)"
       echo "  --system-prompt-file F  Les systemprompt fra fil"
       echo "  --debug                 Bevar raw API-svar og vis tmpdir"
       echo "  --help, -h              Vis denne hjelpen"
@@ -105,8 +124,8 @@ if [[ $# -eq 0 ]]; then
 fi
 PROBLEM="$*"
 
-# Interactive model selection
-if [[ -z "$CLAUDE_MODEL" ]]; then
+# Interactive model selection (only for agents in use)
+if [[ "$AGENT_A_CMD" == "claude" || "$AGENT_B_CMD" == "claude" ]] && [[ -z "$CLAUDE_MODEL" ]]; then
   echo "Velg Claude-modell:"
   for i in "${!CLAUDE_MODELS[@]}"; do
     echo "  $((i+1))) ${CLAUDE_MODELS[$i]}"
@@ -117,7 +136,7 @@ if [[ -z "$CLAUDE_MODEL" ]]; then
   CLAUDE_MODEL="${CLAUDE_MODELS[$((choice-1))]}"
 fi
 
-if [[ -z "$CODEX_MODEL" ]]; then
+if [[ "$AGENT_A_CMD" == "codex" || "$AGENT_B_CMD" == "codex" ]] && [[ -z "$CODEX_MODEL" ]]; then
   echo "Velg Codex-modell:"
   for i in "${!CODEX_MODELS[@]}"; do
     echo "  $((i+1))) ${CODEX_MODELS[$i]}"
@@ -126,6 +145,17 @@ if [[ -z "$CODEX_MODEL" ]]; then
   read -r choice
   choice=${choice:-1}
   CODEX_MODEL="${CODEX_MODELS[$((choice-1))]}"
+fi
+
+if [[ "$AGENT_A_CMD" == "gemini" || "$AGENT_B_CMD" == "gemini" ]] && [[ -z "$GEMINI_MODEL" ]]; then
+  echo "Velg Gemini-modell:"
+  for i in "${!GEMINI_MODELS[@]}"; do
+    echo "  $((i+1))) ${GEMINI_MODELS[$i]}"
+  done
+  printf "Valg [1]: "
+  read -r choice
+  choice=${choice:-1}
+  GEMINI_MODEL="${GEMINI_MODELS[$((choice-1))]}"
 fi
 
 SYSTEM_PROMPT="Du deltar i et samarbeid med en annen AI-agent for å løse et problem.
@@ -176,6 +206,16 @@ parse_claude_output() {
   echo "$raw" | jq -r '.result // empty' 2>/dev/null
 }
 
+parse_gemini_output() {
+  local raw="$1" sid_file="$2"
+  local sid
+  sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
+  if [[ -n "$sid" ]]; then
+    echo "$sid" > "$sid_file"
+  fi
+  echo "$raw" | jq -r '.response // empty' 2>/dev/null
+}
+
 parse_codex_output() {
   local raw="$1" sid_file="$2"
   local sid
@@ -213,6 +253,27 @@ _call_agent() {
       printf -v "$session_var" '%s' "$new_sid"
     fi
     echo "$raw" | jq -r '.result // empty' 2>/dev/null
+  elif [[ "$cmd" == "gemini" ]]; then
+    local args=(gemini -p "$msg" -o json -m "$GEMINI_MODEL")
+    if [[ -n "$session" ]]; then
+      args+=(--resume "$session")
+    fi
+    if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
+      local exit_code=$?
+      if [[ $exit_code -eq 124 ]]; then
+        echo "FEIL: $label API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
+      else
+        echo "FEIL: $label API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
+      fi
+      return 1
+    fi
+    debug_save "$label" "$raw"
+    if [[ -z "$session" ]]; then
+      local new_sid
+      new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
+      printf -v "$session_var" '%s' "$new_sid"
+    fi
+    echo "$raw" | jq -r '.response // empty' 2>/dev/null
   else
     # codex
     if [[ -z "$session" ]]; then
@@ -261,7 +322,15 @@ print_msg() {
   echo -e "${color}${text}${NC}"
 }
 
-BANNER_TITLE="AI DEBATT: ${AGENT_A_NAME} (${CLAUDE_MODEL}) vs ${AGENT_B_NAME} (${CODEX_MODEL})"
+# Resolve model name for each agent
+_agent_model() {
+  case "$1" in
+    claude) echo "$CLAUDE_MODEL" ;;
+    codex)  echo "$CODEX_MODEL" ;;
+    gemini) echo "$GEMINI_MODEL" ;;
+  esac
+}
+BANNER_TITLE="AI DEBATT: ${AGENT_A_NAME} ($(_agent_model "$AGENT_A_CMD")) vs ${AGENT_B_NAME} ($(_agent_model "$AGENT_B_CMD"))"
 BANNER_LEN=${#BANNER_TITLE}
 BANNER_WIDTH=$(( BANNER_LEN + 4 ))
 (( BANNER_WIDTH < 40 )) && BANNER_WIDTH=40
@@ -292,6 +361,8 @@ _r0_cmd() {
   local cmd="$1" outfile="$2" errfile="$3" exitfile="$4"
   if [[ "$cmd" == "claude" ]]; then
     (run_with_timeout claude -p "$start_msg" --model "$CLAUDE_MODEL" --output-format json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
+  elif [[ "$cmd" == "gemini" ]]; then
+    (run_with_timeout gemini -p "$start_msg" -o json -m "$GEMINI_MODEL" 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   else
     (run_with_timeout codex exec -m "$CODEX_MODEL" "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   fi
@@ -304,6 +375,8 @@ _r0_parse() {
   raw=$(cat "$rawfile")
   if [[ "$cmd" == "claude" ]]; then
     parse_claude_output "$raw" "$sidfile"
+  elif [[ "$cmd" == "gemini" ]]; then
+    parse_gemini_output "$raw" "$sidfile"
   else
     parse_codex_output "$raw" "$sidfile"
   fi

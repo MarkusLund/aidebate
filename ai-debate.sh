@@ -79,6 +79,61 @@ GRAY='\033[0;90m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Utility functions for user feedback
+
+# Validate numeric choice is within valid range
+# Usage: validated=$(validate_choice "$input" min max default) || continue
+validate_choice() {
+  local input="$1" min="$2" max="$3" default="$4"
+  if [[ -z "$input" ]]; then
+    echo "$default"
+    return 0
+  fi
+  if ! [[ "$input" =~ ^[0-9]+$ ]] || [[ "$input" -lt "$min" || "$input" -gt "$max" ]]; then
+    echo -e "${YELLOW}Invalid choice: must be $min-$max${NC}" >&2
+    return 1
+  fi
+  echo "$input"
+}
+
+# Spinner for visual feedback during long operations
+SPINNER_PID=""
+start_spinner() {
+  local msg="$1"
+  # Non-TTY: just print static message
+  if [[ ! -t 1 ]]; then
+    echo -e "${GRAY}${msg}${NC}"
+    return
+  fi
+  ( while true; do
+      for c in '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'; do
+        printf "\r${GRAY}%s %s${NC}" "$c" "$msg"
+        sleep 0.1
+      done
+    done ) &
+  SPINNER_PID=$!
+}
+
+stop_spinner() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    printf "\r\033[K"
+    SPINNER_PID=""
+  fi
+}
+
+# Warn on empty API responses
+validate_response() {
+  local response="$1" agent="$2"
+  if [[ -z "$response" || "$response" =~ ^[[:space:]]*$ ]]; then
+    echo -e "${YELLOW}Warning: ${agent} returned empty response${NC}" >&2
+    [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Parse CLI flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -163,10 +218,15 @@ if [[ "$AGENT_A_CMD" == "claude" || "$AGENT_B_CMD" == "claude" ]] && [[ -z "$CLA
   for i in "${!CLAUDE_MODELS[@]}"; do
     echo "  $((i+1))) ${CLAUDE_MODELS[$i]}"
   done
-  printf "Choice [1]: "
-  read -r choice
-  choice=${choice:-1}
-  CLAUDE_MODEL="${CLAUDE_MODELS[$((choice-1))]}"
+  while true; do
+    printf "Choice [1]: "
+    read -r choice
+    if validated=$(validate_choice "$choice" 1 "${#CLAUDE_MODELS[@]}" 1); then
+      CLAUDE_MODEL="${CLAUDE_MODELS[$((validated-1))]}"
+      echo -e "${GRAY}Selected Claude model: $CLAUDE_MODEL${NC}"
+      break
+    fi
+  done
 fi
 
 if [[ "$AGENT_A_CMD" == "codex" || "$AGENT_B_CMD" == "codex" ]] && [[ -z "$CODEX_MODEL" ]]; then
@@ -174,10 +234,15 @@ if [[ "$AGENT_A_CMD" == "codex" || "$AGENT_B_CMD" == "codex" ]] && [[ -z "$CODEX
   for i in "${!CODEX_MODELS[@]}"; do
     echo "  $((i+1))) ${CODEX_MODELS[$i]}"
   done
-  printf "Choice [1]: "
-  read -r choice
-  choice=${choice:-1}
-  CODEX_MODEL="${CODEX_MODELS[$((choice-1))]}"
+  while true; do
+    printf "Choice [1]: "
+    read -r choice
+    if validated=$(validate_choice "$choice" 1 "${#CODEX_MODELS[@]}" 1); then
+      CODEX_MODEL="${CODEX_MODELS[$((validated-1))]}"
+      echo -e "${GRAY}Selected Codex model: $CODEX_MODEL${NC}"
+      break
+    fi
+  done
 fi
 
 if [[ "$AGENT_A_CMD" == "gemini" || "$AGENT_B_CMD" == "gemini" ]] && [[ -z "$GEMINI_MODEL" ]]; then
@@ -185,10 +250,15 @@ if [[ "$AGENT_A_CMD" == "gemini" || "$AGENT_B_CMD" == "gemini" ]] && [[ -z "$GEM
   for i in "${!GEMINI_MODELS[@]}"; do
     echo "  $((i+1))) ${GEMINI_MODELS[$i]}"
   done
-  printf "Choice [1]: "
-  read -r choice
-  choice=${choice:-1}
-  GEMINI_MODEL="${GEMINI_MODELS[$((choice-1))]}"
+  while true; do
+    printf "Choice [1]: "
+    read -r choice
+    if validated=$(validate_choice "$choice" 1 "${#GEMINI_MODELS[@]}" 1); then
+      GEMINI_MODEL="${GEMINI_MODELS[$((validated-1))]}"
+      echo -e "${GRAY}Selected Gemini model: $GEMINI_MODEL${NC}"
+      break
+    fi
+  done
 fi
 
 SYSTEM_PROMPT="You are participating in a collaboration with another AI agent to solve a problem.
@@ -216,8 +286,9 @@ debug_counter=0
 tmpdir=$(mktemp -d)
 if [[ "$DEBUG" == true ]]; then
   echo -e "${GRAY}Debug: tmpdir=$tmpdir${NC}"
+  trap 'stop_spinner 2>/dev/null' EXIT
 else
-  trap 'rm -rf "$tmpdir"' EXIT
+  trap 'stop_spinner 2>/dev/null; rm -rf "$tmpdir"' EXIT
 fi
 
 debug_save() {
@@ -377,6 +448,8 @@ echo -e "${BOLD}╚${BANNER_LINE}╝${NC}"
 echo ""
 echo -e "${YELLOW}Problem:${NC} $PROBLEM"
 echo -e "${GRAY}Max $MAX_MESSAGES messages total${NC}"
+echo ""
+echo -e "${GRAY}Configuration complete. Starting debate...${NC}"
 
 # Round 0: Both get the same starting message in parallel
 start_msg="$SYSTEM_PROMPT
@@ -387,7 +460,7 @@ $PROBLEM
 Remaining messages: $MAX_MESSAGES"
 
 echo ""
-echo -e "${GRAY}Round 0: Both agents thinking in parallel...${NC}"
+start_spinner "Round 0: Both agents thinking in parallel..."
 
 # Helper to build round 0 command for an agent
 _r0_cmd() {
@@ -421,6 +494,7 @@ pid_b=$(_r0_cmd "$AGENT_B_CMD" "$tmpdir/agent_b_raw" "$tmpdir/agent_b_r0_err" "$
 
 wait $pid_a 2>/dev/null || true
 wait $pid_b 2>/dev/null || true
+stop_spinner
 
 agent_a_exit=$(cat "$tmpdir/agent_a_r0_exit" 2>/dev/null || echo "1")
 agent_b_exit=$(cat "$tmpdir/agent_b_r0_exit" 2>/dev/null || echo "1")
@@ -453,6 +527,12 @@ agent_a_session=$(cat "$tmpdir/agent_a_sid" 2>/dev/null || true)
 agent_b_session=$(cat "$tmpdir/agent_b_sid" 2>/dev/null || true)
 msg_count=2
 
+# Validate responses
+validate_response "$agent_a_response" "$AGENT_A_NAME" || true
+validate_response "$agent_b_response" "$AGENT_B_NAME" || true
+
+echo -e "${GRAY}Round 0 complete${NC}"
+
 print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" 1 $((MAX_MESSAGES - msg_count)) "$agent_a_response"
 print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" 2 $((MAX_MESSAGES - msg_count)) "$agent_b_response"
 
@@ -482,7 +562,9 @@ AGREED: ${conclusion}
 Do you agree? If yes, respond with \"AGREED: <same or adjusted conclusion>\". If no, explain why."
 
   local confirm_response
+  start_spinner "Waiting for ${confirmer} to respond..."
   confirm_response=$($call_fn "$confirm_msg")
+  stop_spinner
   msg_count=$((msg_count + 1))
 
   print_msg "$confirm_color" "$confirmer" "$msg_count" $((MAX_MESSAGES - msg_count)) "$confirm_response"
@@ -534,7 +616,9 @@ $agent_b_response
 
 Remaining messages: $((remaining - 1))"
 
+  start_spinner "${AGENT_A_NAME} is thinking..."
   agent_a_response=$(call_agent_a "$agent_a_msg")
+  stop_spinner
   msg_count=$((msg_count + 1))
   print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_a_response"
 
@@ -550,7 +634,9 @@ $agent_a_response
 
 Remaining messages: $((MAX_MESSAGES - msg_count - 1))"
 
+  start_spinner "${AGENT_B_NAME} is thinking..."
   agent_b_response=$(call_agent_b "$agent_b_msg")
+  stop_spinner
   msg_count=$((msg_count + 1))
   print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_b_response"
 

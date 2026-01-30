@@ -1,0 +1,19 @@
+{
+  "name": "aidebate",
+  "version": "1.0.1",
+  "description": "AI debate simulation between Claude and Codex",
+  "bin": {
+    "aidebate": "./ai-debate.sh"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MarkusLund/aidebate"
+  },
+  "keywords": [
+    "ai",
+    "debate",
+    "claude",
+    "codex"
+  ]
+}

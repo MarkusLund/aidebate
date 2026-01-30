@@ -47,6 +47,11 @@ run_with_timeout() {
 
 # AI Debate: Agent A vs Agent B
 
+CLAUDE_MODELS=("haiku" "sonnet" "opus")
+CODEX_MODELS=("gpt-5.1-codex-mini" "gpt-5.2-codex")
+CLAUDE_MODEL=""
+CODEX_MODEL=""
+
 MAX_MESSAGES=10
 API_TIMEOUT=60
 DEBUG=false
@@ -67,6 +72,10 @@ while [[ $# -gt 0 ]]; do
       API_TIMEOUT="$2"; shift 2 ;;
     --system-prompt-file)
       SYSTEM_PROMPT_FILE="$2"; shift 2 ;;
+    --claude-model)
+      CLAUDE_MODEL="$2"; shift 2 ;;
+    --codex-model)
+      CODEX_MODEL="$2"; shift 2 ;;
     --debug)
       DEBUG=true; shift ;;
     --help|-h)
@@ -75,6 +84,8 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --max-rounds N          Maks antall meldinger (default: 10)"
       echo "  --timeout N             API timeout i sekunder (default: 60)"
+      echo "  --claude-model MODEL    Claude-modell (haiku, sonnet, opus)"
+      echo "  --codex-model MODEL     Codex-modell (gpt-5.1-codex-mini, gpt-5.2-codex)"
       echo "  --system-prompt-file F  Les systemprompt fra fil"
       echo "  --debug                 Bevar raw API-svar og vis tmpdir"
       echo "  --help, -h              Vis denne hjelpen"
@@ -93,6 +104,29 @@ if [[ $# -eq 0 ]]; then
   exit 1
 fi
 PROBLEM="$*"
+
+# Interactive model selection
+if [[ -z "$CLAUDE_MODEL" ]]; then
+  echo "Velg Claude-modell:"
+  for i in "${!CLAUDE_MODELS[@]}"; do
+    echo "  $((i+1))) ${CLAUDE_MODELS[$i]}"
+  done
+  printf "Valg [1]: "
+  read -r choice
+  choice=${choice:-1}
+  CLAUDE_MODEL="${CLAUDE_MODELS[$((choice-1))]}"
+fi
+
+if [[ -z "$CODEX_MODEL" ]]; then
+  echo "Velg Codex-modell:"
+  for i in "${!CODEX_MODELS[@]}"; do
+    echo "  $((i+1))) ${CODEX_MODELS[$i]}"
+  done
+  printf "Valg [1]: "
+  read -r choice
+  choice=${choice:-1}
+  CODEX_MODEL="${CODEX_MODELS[$((choice-1))]}"
+fi
 
 SYSTEM_PROMPT="Du deltar i et samarbeid med en annen AI-agent for å løse et problem.
 
@@ -159,7 +193,7 @@ _call_agent() {
   local raw err_file="$tmpdir/${label}_err"
 
   if [[ "$cmd" == "claude" ]]; then
-    local args=(claude -p "$msg" --model haiku --output-format json)
+    local args=(claude -p "$msg" --model "$CLAUDE_MODEL" --output-format json)
     if [[ -n "$session" ]]; then
       args+=(--resume "$session")
     fi
@@ -182,7 +216,7 @@ _call_agent() {
   else
     # codex
     if [[ -z "$session" ]]; then
-      if ! raw=$(run_with_timeout codex exec -m gpt-5.1-codex-mini "$msg" --json 2>"$err_file"); then
+      if ! raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" "$msg" --json 2>"$err_file"); then
         local exit_code=$?
         if [[ $exit_code -eq 124 ]]; then
           echo "FEIL: $label API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
@@ -192,7 +226,7 @@ _call_agent() {
         return 1
       fi
     else
-      if ! raw=$(run_with_timeout codex exec resume "$session" -m gpt-5.1-codex-mini "$msg" --json 2>"$err_file"); then
+      if ! raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" "$msg" --json 2>"$err_file"); then
         local exit_code=$?
         if [[ $exit_code -eq 124 ]]; then
           echo "FEIL: $label API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
@@ -227,13 +261,17 @@ print_msg() {
   echo -e "${color}${text}${NC}"
 }
 
-BANNER_TITLE="AI DEBATT: ${AGENT_A_NAME} vs ${AGENT_B_NAME}"
+BANNER_TITLE="AI DEBATT: ${AGENT_A_NAME} (${CLAUDE_MODEL}) vs ${AGENT_B_NAME} (${CODEX_MODEL})"
 BANNER_LEN=${#BANNER_TITLE}
-BANNER_PAD=$(( (40 - BANNER_LEN) / 2 ))
+BANNER_WIDTH=$(( BANNER_LEN + 4 ))
+(( BANNER_WIDTH < 40 )) && BANNER_WIDTH=40
+BANNER_INNER=$(( BANNER_WIDTH - 2 ))
+BANNER_PAD=$(( (BANNER_INNER - BANNER_LEN) / 2 ))
 BANNER_PAD_STR=$(printf '%*s' "$BANNER_PAD" '')
-echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
-printf "${BOLD}║%s%s%*s║${NC}\n" "$BANNER_PAD_STR" "$BANNER_TITLE" $((40 - BANNER_PAD - BANNER_LEN)) ""
-echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
+BANNER_LINE=$(printf '%*s' "$BANNER_INNER" '' | tr ' ' '═')
+echo -e "${BOLD}╔${BANNER_LINE}╗${NC}"
+printf "${BOLD}║%s%s%*s║${NC}\n" "$BANNER_PAD_STR" "$BANNER_TITLE" $((BANNER_INNER - BANNER_PAD - BANNER_LEN)) ""
+echo -e "${BOLD}╚${BANNER_LINE}╝${NC}"
 echo ""
 echo -e "${YELLOW}Problem:${NC} $PROBLEM"
 echo -e "${GRAY}Maks $MAX_MESSAGES meldinger totalt${NC}"
@@ -253,9 +291,9 @@ echo -e "${GRAY}Runde 0: Begge agenter tenker parallelt...${NC}"
 _r0_cmd() {
   local cmd="$1" outfile="$2" errfile="$3" exitfile="$4"
   if [[ "$cmd" == "claude" ]]; then
-    (run_with_timeout claude -p "$start_msg" --model haiku --output-format json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
+    (run_with_timeout claude -p "$start_msg" --model "$CLAUDE_MODEL" --output-format json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   else
-    (run_with_timeout codex exec -m gpt-5.1-codex-mini "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
+    (run_with_timeout codex exec -m "$CODEX_MODEL" "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   fi
   echo $!
 }

@@ -323,11 +323,17 @@ parse_gemini_output() {
 parse_codex_output() {
   local raw="$1" sid_file="$2"
   local sid
-  sid=$(echo "$raw" | grep '"type":"thread.started"' | jq -r '.thread_id // empty' 2>/dev/null) || true
+  sid=$(echo "$raw" | jq -r 'select(.type=="thread.started") | .thread_id // empty' 2>/dev/null | head -1) || true
   if [[ -n "$sid" ]]; then
     echo "$sid" > "$sid_file"
   fi
-  echo "$raw" | grep '"type":"item.completed"' | grep '"agent_message"' | tail -1 | jq -r '.item.text // empty' 2>/dev/null
+  local text
+  text=$(echo "$raw" | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty' 2>/dev/null | tail -1) || true
+  if [[ -z "$text" ]]; then
+    echo "ERROR: Failed to parse Codex output (no agent_message found in response)" >&2
+    return 1
+  fi
+  echo "$text"
 }
 
 # Generic call function: call_agent <cmd> <session_var_name> <agent_label> <msg>
@@ -404,10 +410,16 @@ _call_agent() {
     debug_save "$label" "$raw"
     if [[ -z "$session" ]]; then
       local new_sid
-      new_sid=$(echo "$raw" | grep '"type":"thread.started"' | jq -r '.thread_id // empty' 2>/dev/null) || true
+      new_sid=$(echo "$raw" | jq -r 'select(.type=="thread.started") | .thread_id // empty' 2>/dev/null | head -1) || true
       printf -v "$session_var" '%s' "$new_sid"
     fi
-    echo "$raw" | grep '"type":"item.completed"' | grep '"agent_message"' | tail -1 | jq -r '.item.text // empty' 2>/dev/null
+    local codex_text
+    codex_text=$(echo "$raw" | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty' 2>/dev/null | tail -1) || true
+    if [[ -z "$codex_text" ]]; then
+      echo "ERROR: $label returned no parseable response. Re-run with --debug to inspect raw output." >&2
+      return 1
+    fi
+    echo "$codex_text"
   fi
 }
 
@@ -528,8 +540,12 @@ agent_b_session=$(cat "$tmpdir/agent_b_sid" 2>/dev/null || true)
 msg_count=2
 
 # Validate responses
-validate_response "$agent_a_response" "$AGENT_A_NAME" || true
-validate_response "$agent_b_response" "$AGENT_B_NAME" || true
+if ! validate_response "$agent_a_response" "$AGENT_A_NAME"; then
+  exit 1
+fi
+if ! validate_response "$agent_b_response" "$AGENT_B_NAME"; then
+  exit 1
+fi
 
 echo -e "${GRAY}Round 0 complete${NC}"
 

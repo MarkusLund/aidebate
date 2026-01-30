@@ -4,7 +4,7 @@ AI debate simulator that pits two AI agents against each other to collaborativel
 
 ## How it works
 
-Two AI agents receive the same problem and independently form their initial hypotheses (round 0, in parallel). They then take turns responding to each other's arguments until they reach agreement or hit the message limit. When one agent proposes a conclusion (prefixed with `ENIG:`), the other is asked to confirm or object.
+Two AI agents receive the same problem and independently form their initial hypotheses (round 0, in parallel). They then take turns responding to each other's arguments until they reach agreement or hit the message limit. When one agent proposes a conclusion (prefixed with `AGREED:`), the other is asked to confirm or object.
 
 ## Supported agents
 

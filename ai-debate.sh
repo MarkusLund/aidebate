@@ -598,11 +598,32 @@ Do you agree? If yes, respond with \"AGREED: <same or adjusted conclusion>\". If
       echo -e "${GRAY}Debug files: $tmpdir/${NC}"
     fi
     post_debate_chat
+    print_resume_commands
     exit 0
   fi
 
   # Not confirmed — update the appropriate response variable for the loop
   printf -v "$response_var" '%s' "$confirm_response"
+}
+
+# Print resume commands for continuing conversation with each agent
+print_resume_commands() {
+  echo ""
+  echo -e "${GRAY}To continue the conversation with an agent, run:${NC}"
+  if [[ -n "$agent_a_session" ]]; then
+    case "$AGENT_A_CMD" in
+      claude) echo -e "  ${AGENT_A_COLOR}${AGENT_A_NAME}:${NC} claude --resume $agent_a_session" ;;
+      codex)  echo -e "  ${AGENT_A_COLOR}${AGENT_A_NAME}:${NC} codex resume $agent_a_session" ;;
+      gemini) echo -e "  ${AGENT_A_COLOR}${AGENT_A_NAME}:${NC} gemini --resume $agent_a_session" ;;
+    esac
+  fi
+  if [[ -n "$agent_b_session" ]]; then
+    case "$AGENT_B_CMD" in
+      claude) echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} claude --resume $agent_b_session" ;;
+      codex)  echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} codex resume $agent_b_session" ;;
+      gemini) echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} gemini --resume $agent_b_session" ;;
+    esac
+  fi
 }
 
 # Post-debate chat: continue conversation with one agent
@@ -724,3 +745,4 @@ if [[ "$DEBUG" == true ]]; then
   echo -e "${GRAY}Debug files: $tmpdir/${NC}"
 fi
 post_debate_chat
+print_resume_commands

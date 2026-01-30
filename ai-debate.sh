@@ -118,11 +118,44 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: bash ai-debate.sh [OPTIONS] \"<problem>\""
-  echo "Use --help for more options."
-  exit 1
+  # No problem provided — open an editor for multiline input
+  EDITORS=()
+  EDITOR_NAMES=()
+  # Detect available editors
+  command -v nano &>/dev/null && EDITORS+=("nano") && EDITOR_NAMES+=("nano")
+  command -v vim &>/dev/null && EDITORS+=("vim") && EDITOR_NAMES+=("vim")
+  command -v vi &>/dev/null && [[ ! " ${EDITORS[*]} " =~ " vim " ]] && EDITORS+=("vi") && EDITOR_NAMES+=("vi")
+  command -v code &>/dev/null && EDITORS+=("code --wait") && EDITOR_NAMES+=("VS Code")
+  command -v cursor &>/dev/null && EDITORS+=("cursor --wait") && EDITOR_NAMES+=("Cursor")
+
+  if [[ ${#EDITORS[@]} -eq 0 ]]; then
+    echo "Error: No text editor found. Please provide your problem as an argument."
+    echo "Usage: bash ai-debate.sh [OPTIONS] \"<problem>\""
+    exit 1
+  fi
+
+  echo "No problem provided. Select an editor to write your problem:"
+  for i in "${!EDITOR_NAMES[@]}"; do
+    echo "  $((i+1))) ${EDITOR_NAMES[$i]}"
+  done
+  printf "Choice [1]: "
+  read -r choice
+  choice=${choice:-1}
+  SELECTED_EDITOR="${EDITORS[$((choice-1))]}"
+
+  TMPFILE=$(mktemp /tmp/aidebate-problem.XXXXXX) || exit 1
+  $SELECTED_EDITOR "$TMPFILE"
+
+  PROBLEM=$(cat "$TMPFILE")
+  rm -f "$TMPFILE"
+
+  if [[ -z "$PROBLEM" ]]; then
+    echo "Error: No problem provided. Aborting."
+    exit 1
+  fi
+else
+  PROBLEM="$*"
 fi
-PROBLEM="$*"
 
 # Interactive model selection (only for agents in use)
 if [[ "$AGENT_A_CMD" == "claude" || "$AGENT_B_CMD" == "claude" ]] && [[ -z "$CLAUDE_MODEL" ]]; then

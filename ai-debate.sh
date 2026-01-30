@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verify required tools
-for cmd in claude codex jq; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "Feil: '$cmd' ikke funnet i PATH"; exit 1; }
-done
+# Detect available tools
+HAS_CLAUDE=false; HAS_CODEX=false
+command -v claude >/dev/null 2>&1 && HAS_CLAUDE=true
+command -v codex >/dev/null 2>&1 && HAS_CODEX=true
+command -v jq >/dev/null 2>&1 || { echo "Feil: 'jq' ikke funnet i PATH"; exit 1; }
+if ! $HAS_CLAUDE && ! $HAS_CODEX; then
+  echo "Feil: Verken 'claude' eller 'codex' funnet i PATH"; exit 1
+fi
+
+# Determine agent assignments
+if $HAS_CLAUDE && $HAS_CODEX; then
+  AGENT_A_CMD=claude; AGENT_B_CMD=codex
+  AGENT_A_NAME="Claude"; AGENT_B_NAME="Codex"
+  AGENT_A_COLOR='\033[1;34m'; AGENT_B_COLOR='\033[1;32m'
+elif $HAS_CLAUDE; then
+  echo "Advarsel: 'codex' ikke funnet. Bruker claude for begge agenter."
+  AGENT_A_CMD=claude; AGENT_B_CMD=claude
+  AGENT_A_NAME="Claude (1)"; AGENT_B_NAME="Claude (2)"
+  AGENT_A_COLOR='\033[1;34m'; AGENT_B_COLOR='\033[1;36m'
+else
+  echo "Advarsel: 'claude' ikke funnet. Bruker codex for begge agenter."
+  AGENT_A_CMD=codex; AGENT_B_CMD=codex
+  AGENT_A_NAME="Codex (1)"; AGENT_B_NAME="Codex (2)"
+  AGENT_A_COLOR='\033[1;32m'; AGENT_B_COLOR='\033[1;36m'
+fi
 
 # macOS doesn't have timeout by default (coreutils provides gtimeout)
 if command -v timeout >/dev/null 2>&1; then
@@ -24,7 +45,7 @@ run_with_timeout() {
   fi
 }
 
-# AI Debate: Claude (haiku) vs Codex (gpt-5.1-codex-mini)
+# AI Debate: Agent A vs Agent B
 
 MAX_MESSAGES=10
 API_TIMEOUT=60
@@ -89,8 +110,8 @@ if [[ -n "$SYSTEM_PROMPT_FILE" ]]; then
   SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
 fi
 
-claude_session=""
-codex_session=""
+agent_a_session=""
+agent_b_session=""
 msg_count=0
 debug_counter=0
 
@@ -111,80 +132,92 @@ debug_save() {
   fi
 }
 
-parse_claude() {
-  local raw
-  raw=$(cat)
+parse_claude_output() {
+  local raw="$1" sid_file="$2"
   local sid
   sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
   if [[ -n "$sid" ]]; then
-    echo "$sid" > "$tmpdir/claude_sid"
+    echo "$sid" > "$sid_file"
   fi
   echo "$raw" | jq -r '.result // empty' 2>/dev/null
 }
 
-parse_codex() {
-  local raw
-  raw=$(cat)
+parse_codex_output() {
+  local raw="$1" sid_file="$2"
   local sid
   sid=$(echo "$raw" | grep '"type":"thread.started"' | jq -r '.thread_id // empty' 2>/dev/null) || true
   if [[ -n "$sid" ]]; then
-    echo "$sid" > "$tmpdir/codex_sid"
+    echo "$sid" > "$sid_file"
   fi
   echo "$raw" | grep '"type":"item.completed"' | grep '"agent_message"' | tail -1 | jq -r '.item.text // empty' 2>/dev/null
 }
 
-call_claude() {
-  local msg="$1"
-  local args=(claude -p "$msg" --model haiku --output-format json)
-  if [[ -n "$claude_session" ]]; then
-    args+=(--resume "$claude_session")
-  fi
-  local raw err_file="$tmpdir/claude_err"
-  if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
-    local exit_code=$?
-    if [[ $exit_code -eq 124 ]]; then
-      echo "FEIL: Claude API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
-    else
-      echo "FEIL: Claude API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
-    fi
-    return 1
-  fi
-  debug_save "claude" "$raw"
-  if [[ -z "$claude_session" ]]; then
-    claude_session=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
-  fi
-  echo "$raw" | jq -r '.result // empty' 2>/dev/null
-}
+# Generic call function: call_agent <cmd> <session_var_name> <agent_label> <msg>
+_call_agent() {
+  local cmd="$1" session_var="$2" label="$3" msg="$4"
+  local session="${!session_var}"
+  local raw err_file="$tmpdir/${label}_err"
 
-call_codex() {
-  local msg="$1"
-  local raw err_file="$tmpdir/codex_err"
-  if [[ -z "$codex_session" ]]; then
-    if ! raw=$(run_with_timeout codex exec -m gpt-5.1-codex-mini "$msg" --json 2>"$err_file"); then
+  if [[ "$cmd" == "claude" ]]; then
+    local args=(claude -p "$msg" --model haiku --output-format json)
+    if [[ -n "$session" ]]; then
+      args+=(--resume "$session")
+    fi
+    if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
       local exit_code=$?
       if [[ $exit_code -eq 124 ]]; then
-        echo "FEIL: Codex API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
+        echo "FEIL: $label API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
       else
-        echo "FEIL: Codex API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
+        echo "FEIL: $label API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
       fi
       return 1
     fi
+    debug_save "$label" "$raw"
+    if [[ -z "$session" ]]; then
+      local new_sid
+      new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
+      printf -v "$session_var" '%s' "$new_sid"
+    fi
+    echo "$raw" | jq -r '.result // empty' 2>/dev/null
   else
-    if ! raw=$(run_with_timeout codex exec resume "$codex_session" -m gpt-5.1-codex-mini "$msg" --json 2>"$err_file"); then
-      local exit_code=$?
-      if [[ $exit_code -eq 124 ]]; then
-        echo "FEIL: Codex API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
-      else
-        echo "FEIL: Codex API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
+    # codex
+    if [[ -z "$session" ]]; then
+      if ! raw=$(run_with_timeout codex exec -m gpt-5.1-codex-mini "$msg" --json 2>"$err_file"); then
+        local exit_code=$?
+        if [[ $exit_code -eq 124 ]]; then
+          echo "FEIL: $label API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
+        else
+          echo "FEIL: $label API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
+        fi
+        return 1
       fi
-      return 1
+    else
+      if ! raw=$(run_with_timeout codex exec resume "$session" -m gpt-5.1-codex-mini "$msg" --json 2>"$err_file"); then
+        local exit_code=$?
+        if [[ $exit_code -eq 124 ]]; then
+          echo "FEIL: $label API-kall tidsavbrutt etter ${API_TIMEOUT}s" >&2
+        else
+          echo "FEIL: $label API-kall feilet (exit $exit_code): $(cat "$err_file")" >&2
+        fi
+        return 1
+      fi
     fi
+    debug_save "$label" "$raw"
+    if [[ -z "$session" ]]; then
+      local new_sid
+      new_sid=$(echo "$raw" | grep '"type":"thread.started"' | jq -r '.thread_id // empty' 2>/dev/null) || true
+      printf -v "$session_var" '%s' "$new_sid"
+    fi
+    echo "$raw" | grep '"type":"item.completed"' | grep '"agent_message"' | tail -1 | jq -r '.item.text // empty' 2>/dev/null
   fi
-  debug_save "codex" "$raw"
-  if [[ -z "$codex_session" ]]; then
-    codex_session=$(echo "$raw" | grep '"type":"thread.started"' | jq -r '.thread_id // empty' 2>/dev/null) || true
-  fi
-  echo "$raw" | grep '"type":"item.completed"' | grep '"agent_message"' | tail -1 | jq -r '.item.text // empty' 2>/dev/null
+}
+
+call_agent_a() {
+  _call_agent "$AGENT_A_CMD" agent_a_session "agent_a" "$1"
+}
+
+call_agent_b() {
+  _call_agent "$AGENT_B_CMD" agent_b_session "agent_b" "$1"
 }
 
 print_msg() {
@@ -194,8 +227,12 @@ print_msg() {
   echo -e "${color}${text}${NC}"
 }
 
+BANNER_TITLE="AI DEBATT: ${AGENT_A_NAME} vs ${AGENT_B_NAME}"
+BANNER_LEN=${#BANNER_TITLE}
+BANNER_PAD=$(( (40 - BANNER_LEN) / 2 ))
+BANNER_PAD_STR=$(printf '%*s' "$BANNER_PAD" '')
 echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║        AI DEBATT: Claude vs Codex      ║${NC}"
+printf "${BOLD}║%s%s%*s║${NC}\n" "$BANNER_PAD_STR" "$BANNER_TITLE" $((40 - BANNER_PAD - BANNER_LEN)) ""
 echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${YELLOW}Problem:${NC} $PROBLEM"
@@ -212,48 +249,68 @@ Gjenværende meldinger: $MAX_MESSAGES"
 echo ""
 echo -e "${GRAY}Runde 0: Begge agenter tenker parallelt...${NC}"
 
-# Run both in background, writing raw output to files
-(run_with_timeout claude -p "$start_msg" --model haiku --output-format json 2>"$tmpdir/claude_r0_err" > "$tmpdir/claude_raw"; echo $? > "$tmpdir/claude_r0_exit") &
-pid_claude=$!
-(run_with_timeout codex exec -m gpt-5.1-codex-mini "$start_msg" --json 2>"$tmpdir/codex_r0_err" > "$tmpdir/codex_raw"; echo $? > "$tmpdir/codex_r0_exit") &
-pid_codex=$!
-
-wait $pid_claude 2>/dev/null || true
-wait $pid_codex 2>/dev/null || true
-
-claude_exit=$(cat "$tmpdir/claude_r0_exit" 2>/dev/null || echo "1")
-codex_exit=$(cat "$tmpdir/codex_r0_exit" 2>/dev/null || echo "1")
-
-if [[ "$claude_exit" != "0" ]]; then
-  if [[ "$claude_exit" == "124" ]]; then
-    echo "FEIL: Claude runde 0 tidsavbrutt etter ${API_TIMEOUT}s" >&2
+# Helper to build round 0 command for an agent
+_r0_cmd() {
+  local cmd="$1" outfile="$2" errfile="$3" exitfile="$4"
+  if [[ "$cmd" == "claude" ]]; then
+    (run_with_timeout claude -p "$start_msg" --model haiku --output-format json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   else
-    echo "FEIL: Claude runde 0 feilet (exit $claude_exit): $(cat "$tmpdir/claude_r0_err" 2>/dev/null)" >&2
+    (run_with_timeout codex exec -m gpt-5.1-codex-mini "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
+  fi
+  echo $!
+}
+
+_r0_parse() {
+  local cmd="$1" rawfile="$2" sidfile="$3"
+  local raw
+  raw=$(cat "$rawfile")
+  if [[ "$cmd" == "claude" ]]; then
+    parse_claude_output "$raw" "$sidfile"
+  else
+    parse_codex_output "$raw" "$sidfile"
+  fi
+}
+
+# Run both in background, writing raw output to files
+pid_a=$(_r0_cmd "$AGENT_A_CMD" "$tmpdir/agent_a_raw" "$tmpdir/agent_a_r0_err" "$tmpdir/agent_a_r0_exit")
+pid_b=$(_r0_cmd "$AGENT_B_CMD" "$tmpdir/agent_b_raw" "$tmpdir/agent_b_r0_err" "$tmpdir/agent_b_r0_exit")
+
+wait $pid_a 2>/dev/null || true
+wait $pid_b 2>/dev/null || true
+
+agent_a_exit=$(cat "$tmpdir/agent_a_r0_exit" 2>/dev/null || echo "1")
+agent_b_exit=$(cat "$tmpdir/agent_b_r0_exit" 2>/dev/null || echo "1")
+
+if [[ "$agent_a_exit" != "0" ]]; then
+  if [[ "$agent_a_exit" == "124" ]]; then
+    echo "FEIL: $AGENT_A_NAME runde 0 tidsavbrutt etter ${API_TIMEOUT}s" >&2
+  else
+    echo "FEIL: $AGENT_A_NAME runde 0 feilet (exit $agent_a_exit): $(cat "$tmpdir/agent_a_r0_err" 2>/dev/null)" >&2
   fi
   exit 1
 fi
-if [[ "$codex_exit" != "0" ]]; then
-  if [[ "$codex_exit" == "124" ]]; then
-    echo "FEIL: Codex runde 0 tidsavbrutt etter ${API_TIMEOUT}s" >&2
+if [[ "$agent_b_exit" != "0" ]]; then
+  if [[ "$agent_b_exit" == "124" ]]; then
+    echo "FEIL: $AGENT_B_NAME runde 0 tidsavbrutt etter ${API_TIMEOUT}s" >&2
   else
-    echo "FEIL: Codex runde 0 feilet (exit $codex_exit): $(cat "$tmpdir/codex_r0_err" 2>/dev/null)" >&2
+    echo "FEIL: $AGENT_B_NAME runde 0 feilet (exit $agent_b_exit): $(cat "$tmpdir/agent_b_r0_err" 2>/dev/null)" >&2
   fi
   exit 1
 fi
 
 # Save debug output for round 0
-debug_save "claude_r0" "$(cat "$tmpdir/claude_raw")"
-debug_save "codex_r0" "$(cat "$tmpdir/codex_raw")"
+debug_save "agent_a_r0" "$(cat "$tmpdir/agent_a_raw")"
+debug_save "agent_b_r0" "$(cat "$tmpdir/agent_b_raw")"
 
 # Parse results
-claude_response=$(cat "$tmpdir/claude_raw" | parse_claude)
-codex_response=$(cat "$tmpdir/codex_raw" | parse_codex)
-claude_session=$(cat "$tmpdir/claude_sid" 2>/dev/null || true)
-codex_session=$(cat "$tmpdir/codex_sid" 2>/dev/null || true)
+agent_a_response=$(_r0_parse "$AGENT_A_CMD" "$tmpdir/agent_a_raw" "$tmpdir/agent_a_sid")
+agent_b_response=$(_r0_parse "$AGENT_B_CMD" "$tmpdir/agent_b_raw" "$tmpdir/agent_b_sid")
+agent_a_session=$(cat "$tmpdir/agent_a_sid" 2>/dev/null || true)
+agent_b_session=$(cat "$tmpdir/agent_b_sid" 2>/dev/null || true)
 msg_count=2
 
-print_msg "$BLUE" "Claude" 1 $((MAX_MESSAGES - msg_count)) "$claude_response"
-print_msg "$GREEN" "Codex" 2 $((MAX_MESSAGES - msg_count)) "$codex_response"
+print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" 1 $((MAX_MESSAGES - msg_count)) "$agent_a_response"
+print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" 2 $((MAX_MESSAGES - msg_count)) "$agent_b_response"
 
 # Extract ENIG conclusion from a response
 extract_enig() {
@@ -266,8 +323,9 @@ has_enig() {
 }
 
 # When one agent says ENIG, ask the other to confirm
+# Args: proposer_name proposal confirmer_name confirmer_call_fn confirmer_color confirmer_response_var
 confirm_agreement() {
-  local proposer="$1" proposal="$2" confirmer="$3" call_fn="$4"
+  local proposer="$1" proposal="$2" confirmer="$3" call_fn="$4" confirm_color="$5" response_var="$6"
   local conclusion
   conclusion=$(extract_enig "$proposal")
 
@@ -283,8 +341,6 @@ Er du enig? Hvis ja, svar med \"ENIG: <samme eller justert konklusjon>\". Hvis n
   confirm_response=$($call_fn "$confirm_msg")
   msg_count=$((msg_count + 1))
 
-  local confirm_color
-  if [[ "$confirmer" == "Claude" ]]; then confirm_color="$BLUE"; else confirm_color="$GREEN"; fi
   print_msg "$confirm_color" "$confirmer" "$msg_count" $((MAX_MESSAGES - msg_count)) "$confirm_response"
 
   if has_enig "$confirm_response"; then
@@ -303,63 +359,59 @@ Er du enig? Hvis ja, svar med \"ENIG: <samme eller justert konklusjon>\". Hvis n
   fi
 
   # Not confirmed — update the appropriate response variable for the loop
-  if [[ "$confirmer" == "Claude" ]]; then
-    claude_response="$confirm_response"
-  else
-    codex_response="$confirm_response"
-  fi
+  printf -v "$response_var" '%s' "$confirm_response"
 }
 
 # Check round 0 for early agreement
-if has_enig "$claude_response" && has_enig "$codex_response"; then
+if has_enig "$agent_a_response" && has_enig "$agent_b_response"; then
   echo ""
   echo -e "${YELLOW}╔════════════════════════════════════════╗${NC}"
   echo -e "${YELLOW}║           ENIGHET OPPNÅDD             ║${NC}"
   echo -e "${YELLOW}╚════════════════════════════════════════╝${NC}"
-  echo -e "${BOLD}Konklusjon:${NC} $(extract_enig "$claude_response")"
+  echo -e "${BOLD}Konklusjon:${NC} $(extract_enig "$agent_a_response")"
   echo -e "${GRAY}Meldinger brukt: ${msg_count}/${MAX_MESSAGES}${NC}"
   if [[ "$DEBUG" == true ]]; then
     echo -e "${GRAY}Debug-filer: $tmpdir/${NC}"
   fi
   exit 0
-elif has_enig "$claude_response"; then
-  confirm_agreement "Claude" "$claude_response" "Codex" call_codex
-elif has_enig "$codex_response"; then
-  confirm_agreement "Codex" "$codex_response" "Claude" call_claude
+elif has_enig "$agent_a_response"; then
+  confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
+elif has_enig "$agent_b_response"; then
+  confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
 fi
 
 # Rounds 1+: Ping-pong (sequential, so session vars work)
 while [[ $msg_count -lt $MAX_MESSAGES ]]; do
   remaining=$((MAX_MESSAGES - msg_count))
 
-  # Claude gets Codex's last response
-  claude_msg="Codex sin melding:
-$codex_response
+  # Agent A gets Agent B's last response
+  agent_a_msg="$AGENT_B_NAME sin melding:
+$agent_b_response
 
 Gjenværende meldinger: $((remaining - 1))"
 
-  claude_response=$(call_claude "$claude_msg")
+  agent_a_response=$(call_agent_a "$agent_a_msg")
   msg_count=$((msg_count + 1))
-  print_msg "$BLUE" "Claude" "$msg_count" $((MAX_MESSAGES - msg_count)) "$claude_response"
+  print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_a_response"
 
-  if has_enig "$claude_response"; then
-    confirm_agreement "Claude" "$claude_response" "Codex" call_codex
+  if has_enig "$agent_a_response"; then
+    confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
   fi
 
   if [[ $msg_count -ge $MAX_MESSAGES ]]; then break; fi
 
-  # Codex gets Claude's last response
-  codex_msg="Claude sin melding:
-$claude_response
+  # Agent B gets Agent A's last response
+  agent_b_msg="$AGENT_A_NAME sin melding:
+$agent_a_response
 
 Gjenværende meldinger: $((MAX_MESSAGES - msg_count - 1))"
 
-  codex_response=$(call_codex "$codex_msg")
+  agent_b_response=$(call_agent_b "$agent_b_msg")
   msg_count=$((msg_count + 1))
-  print_msg "$GREEN" "Codex" "$msg_count" $((MAX_MESSAGES - msg_count)) "$codex_response"
+  print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_b_response"
 
-  if has_enig "$codex_response"; then
-    confirm_agreement "Codex" "$codex_response" "Claude" call_claude
+  if has_enig "$agent_b_response"; then
+    confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
   fi
 done
 
@@ -369,8 +421,8 @@ echo -e "${YELLOW}║         DEBATTEN ER OVER              ║${NC}"
 echo -e "${YELLOW}╚════════════════════════════════════════╝${NC}"
 echo -e "Ingen enighet etter ${MAX_MESSAGES} meldinger."
 echo -e "${BOLD}Siste standpunkter:${NC}"
-echo -e "  ${BLUE}Claude:${NC} $(echo "$claude_response" | head -3)"
-echo -e "  ${GREEN}Codex:${NC} $(echo "$codex_response" | head -3)"
+echo -e "  ${AGENT_A_COLOR}${AGENT_A_NAME}:${NC} $(echo "$agent_a_response" | head -3)"
+echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} $(echo "$agent_b_response" | head -3)"
 if [[ "$DEBUG" == true ]]; then
   echo -e "${GRAY}Debug-filer: $tmpdir/${NC}"
 fi

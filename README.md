@@ -37,6 +37,12 @@ bash ai-debate.sh "Your problem here"
 aidebate [OPTIONS] "<problem>"
 ```
 
+If no problem argument is provided, you'll be prompted to select an editor (nano, vim, VS Code, or Cursor) to compose a multiline problem. This is useful for complex prompts that don't fit well on a single command line.
+
+### Post-debate chat
+
+After a debate concludes (either by agreement or reaching the message limit), you can continue chatting with one of the agents. The agent retains full context from the debate, allowing you to ask follow-up questions, explore specific points, or dive deeper into the topic.
+
 ### Options
 
 | Flag | Description | Default |

@@ -597,11 +597,61 @@ Do you agree? If yes, respond with \"AGREED: <same or adjusted conclusion>\". If
     if [[ "$DEBUG" == true ]]; then
       echo -e "${GRAY}Debug files: $tmpdir/${NC}"
     fi
+    post_debate_chat
     exit 0
   fi
 
   # Not confirmed — update the appropriate response variable for the loop
   printf -v "$response_var" '%s' "$confirm_response"
+}
+
+# Post-debate chat: continue conversation with one agent
+post_debate_chat() {
+  echo ""
+  echo -e "${GRAY}Would you like to continue chatting with one of the agents? (y/n)${NC}"
+  read -r continue_chat
+  [[ "$continue_chat" != "y" && "$continue_chat" != "Y" ]] && return
+
+  # Agent selection
+  echo "Select an agent to chat with:"
+  echo "  1) $AGENT_A_NAME"
+  echo "  2) $AGENT_B_NAME"
+  printf "Choice [1]: "
+  read -r agent_choice
+  agent_choice=${agent_choice:-1}
+
+  local chat_agent_name chat_agent_color call_fn
+  if [[ "$agent_choice" == "2" ]]; then
+    chat_agent_name="$AGENT_B_NAME"
+    chat_agent_color="$AGENT_B_COLOR"
+    call_fn=call_agent_b
+  else
+    chat_agent_name="$AGENT_A_NAME"
+    chat_agent_color="$AGENT_A_COLOR"
+    call_fn=call_agent_a
+  fi
+
+  echo ""
+  echo -e "${GRAY}Chatting with ${chat_agent_name}. Type 'exit' or 'quit' to end.${NC}"
+
+  while true; do
+    echo ""
+    printf "${BOLD}You:${NC} "
+    read -r user_input
+
+    [[ -z "$user_input" || "$user_input" == "exit" || "$user_input" == "quit" ]] && break
+
+    start_spinner "${chat_agent_name} is thinking..."
+    local response
+    response=$($call_fn "$user_input")
+    stop_spinner
+
+    echo ""
+    echo -e "${chat_agent_color}━━━ ${chat_agent_name} ━━━${NC}"
+    echo -e "${chat_agent_color}${response}${NC}"
+  done
+
+  echo -e "${GRAY}Chat ended.${NC}"
 }
 
 # Check round 0 for early agreement
@@ -615,6 +665,7 @@ if has_agreed "$agent_a_response" && has_agreed "$agent_b_response"; then
   if [[ "$DEBUG" == true ]]; then
     echo -e "${GRAY}Debug files: $tmpdir/${NC}"
   fi
+  post_debate_chat
   exit 0
 elif has_agreed "$agent_a_response"; then
   confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
@@ -672,3 +723,4 @@ echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} $(echo "$agent_b_response" | he
 if [[ "$DEBUG" == true ]]; then
   echo -e "${GRAY}Debug files: $tmpdir/${NC}"
 fi
+post_debate_chat

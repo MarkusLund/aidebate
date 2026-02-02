@@ -387,7 +387,7 @@ _call_agent() {
   else
     # codex
     if [[ -z "$session" ]]; then
-      if ! raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" "$msg" --json 2>"$err_file"); then
+      if ! raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
         local exit_code=$?
         if [[ $exit_code -eq 124 ]]; then
           echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
@@ -397,7 +397,7 @@ _call_agent() {
         return 1
       fi
     else
-      if ! raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" "$msg" --json 2>"$err_file"); then
+      if ! raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
         local exit_code=$?
         if [[ $exit_code -eq 124 ]]; then
           echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
@@ -482,7 +482,7 @@ _r0_cmd() {
   elif [[ "$cmd" == "gemini" ]]; then
     (run_with_timeout gemini -p "$start_msg" -o json -m "$GEMINI_MODEL" 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   else
-    (run_with_timeout codex exec -m "$CODEX_MODEL" "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
+    (run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
   fi
   echo $!
 }

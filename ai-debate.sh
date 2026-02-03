@@ -261,13 +261,21 @@ if [[ "$AGENT_A_CMD" == "gemini" || "$AGENT_B_CMD" == "gemini" ]] && [[ -z "$GEM
   done
 fi
 
-SYSTEM_PROMPT="You are participating in a collaboration with another AI agent to solve a problem.
+SYSTEM_PROMPT="You are participating in a critical debate with another AI agent to solve a problem.
 
-This first message is your chance to think through the problem on your own and formulate your hypothesis.
-After this you will receive the other agent's perspective, and you will exchange responses back and forth.
+IMPORTANT GUIDELINES:
+1. Be THOROUGH and CRITICAL - do not agree too quickly. Challenge assumptions, identify gaps, and push back on incomplete analyses.
+2. Provide DETAILED EVIDENCE for your claims - cite specific code, line numbers, documentation, or reasoning.
+3. If the other agent proposes a hypothesis, stress-test it. Look for edge cases, alternative explanations, or overlooked factors.
+4. Only agree when you are CONVINCED the analysis is complete and correct. If something is missing, say so.
+5. Each response should ADD NEW INFORMATION or INSIGHTS - don't just restate what's already been said.
 
-Max $MAX_MESSAGES messages total. Be concise.
-When you agree, write the conclusion on its own line starting with \"AGREED:\" followed by the conclusion."
+This first message is your chance to think deeply through the problem. Explore multiple angles, consider alternative hypotheses, and formulate a well-reasoned position. Be thorough, not brief.
+
+After this you will receive the other agent's perspective, and you will exchange responses back and forth. Challenge each other constructively to arrive at the best possible conclusion.
+
+Max $MAX_MESSAGES messages total.
+When you are fully satisfied that a complete and correct conclusion has been reached, write it on its own line starting with \"AGREED:\" followed by the conclusion. Do NOT agree prematurely."
 
 if [[ -n "$SYSTEM_PROMPT_FILE" ]]; then
   if [[ ! -f "$SYSTEM_PROMPT_FILE" ]]; then
@@ -281,6 +289,12 @@ agent_a_session=""
 agent_b_session=""
 msg_count=0
 debug_counter=0
+
+# Extension feature state
+EXTENSION_CONTEXT=""
+EXTENSION_CONTEXT_SENT_A=false
+EXTENSION_CONTEXT_SENT_B=false
+DEBATE_AGREED=false
 
 # Temp dir for round 0 communication and debug output
 tmpdir=$(mktemp -d)
@@ -575,7 +589,14 @@ confirm_agreement() {
   local confirm_msg="${proposer} proposes that you have reached agreement and concludes with:
 AGREED: ${conclusion}
 
-Do you agree? If yes, respond with \"AGREED: <same or adjusted conclusion>\". If no, explain why."
+CRITICAL REVIEW REQUIRED: Before agreeing, carefully evaluate:
+1. Is this conclusion COMPLETE? Are there any gaps in the analysis?
+2. Is it CORRECT? Have all alternative explanations been considered and ruled out?
+3. Is there sufficient EVIDENCE to support this conclusion?
+4. Are there any edge cases, caveats, or nuances that should be included?
+
+If the analysis is incomplete or you have additional insights to add, explain what's missing and continue the debate.
+Only respond with \"AGREED: <conclusion>\" if you are fully satisfied this is a thorough and correct answer."
 
   local confirm_response
   start_spinner "Waiting for ${confirmer} to respond..."
@@ -597,9 +618,8 @@ Do you agree? If yes, respond with \"AGREED: <same or adjusted conclusion>\". If
     if [[ "$DEBUG" == true ]]; then
       echo -e "${GRAY}Debug files: $tmpdir/${NC}"
     fi
-    post_debate_chat
-    print_resume_commands
-    exit 0
+    DEBATE_AGREED=true
+    return 0
   fi
 
   # Not confirmed — update the appropriate response variable for the loop
@@ -624,6 +644,100 @@ print_resume_commands() {
       gemini) echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} gemini --resume $agent_b_session" ;;
     esac
   fi
+}
+
+# Prompt user to extend the debate with more messages
+# Returns 0 if extending, 1 if not
+prompt_extend_debate() {
+  echo ""
+  echo -e "${YELLOW}╔════════════════════════════════════════╗${NC}"
+  echo -e "${YELLOW}║          DEBATE LIMIT REACHED          ║${NC}"
+  echo -e "${YELLOW}╚════════════════════════════════════════╝${NC}"
+  echo -e "No agreement after ${MAX_MESSAGES} messages."
+  echo -e "${BOLD}Final positions:${NC}"
+  echo -e "  ${AGENT_A_COLOR}${AGENT_A_NAME}:${NC} $(echo "$agent_a_response" | head -3)"
+  echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} $(echo "$agent_b_response" | head -3)"
+  if [[ "$DEBUG" == true ]]; then
+    echo -e "${GRAY}Debug files: $tmpdir/${NC}"
+  fi
+
+  echo ""
+  printf "Would you like to extend the debate with more messages? (y/n) "
+  read -r extend_choice
+  if [[ "$extend_choice" != "y" && "$extend_choice" != "Y" ]]; then
+    return 1
+  fi
+
+  # Get number of additional messages
+  printf "How many additional messages? [5]: "
+  read -r additional_msgs
+  additional_msgs=${additional_msgs:-5}
+  if ! [[ "$additional_msgs" =~ ^[0-9]+$ ]] || [[ "$additional_msgs" -lt 1 ]]; then
+    echo -e "${YELLOW}Invalid number, using 5${NC}"
+    additional_msgs=5
+  fi
+
+  # Option to inject context
+  printf "Would you like to inject additional context/guidance for both agents? (y/n) "
+  read -r inject_choice
+  if [[ "$inject_choice" == "y" || "$inject_choice" == "Y" ]]; then
+    echo "Enter additional context (or 'edit' to open an editor):"
+    printf "> "
+    read -r context_input
+    if [[ "$context_input" == "edit" ]]; then
+      # Open editor for multiline context
+      local context_file
+      context_file=$(mktemp /tmp/aidebate-context.XXXXXX) || return 1
+      ${EDITOR:-nano} "$context_file"
+      EXTENSION_CONTEXT=$(cat "$context_file")
+      rm -f "$context_file"
+    else
+      EXTENSION_CONTEXT="$context_input"
+    fi
+    if [[ -n "$EXTENSION_CONTEXT" ]]; then
+      echo -e "${GRAY}Context will be injected into the next exchange.${NC}"
+      EXTENSION_CONTEXT_SENT_A=false
+      EXTENSION_CONTEXT_SENT_B=false
+    fi
+  fi
+
+  # Update max messages
+  local old_max=$MAX_MESSAGES
+  MAX_MESSAGES=$((MAX_MESSAGES + additional_msgs))
+  echo ""
+  echo -e "${GRAY}Debate extended by ${additional_msgs} messages. New limit: ${MAX_MESSAGES}${NC}"
+  echo -e "${GRAY}Continuing debate...${NC}"
+
+  return 0
+}
+
+# Build message for an agent, injecting extension context if applicable
+# Args: other_name other_response remaining is_agent_a
+build_agent_message() {
+  local other_name="$1" other_response="$2" remaining="$3" is_agent_a="$4"
+  local msg=""
+
+  # Check if we need to inject extension context
+  if [[ -n "$EXTENSION_CONTEXT" ]]; then
+    if [[ "$is_agent_a" == "true" && "$EXTENSION_CONTEXT_SENT_A" == "false" ]]; then
+      msg="[ADDITIONAL CONTEXT FROM USER]: ${EXTENSION_CONTEXT}
+
+"
+      EXTENSION_CONTEXT_SENT_A=true
+    elif [[ "$is_agent_a" == "false" && "$EXTENSION_CONTEXT_SENT_B" == "false" ]]; then
+      msg="[ADDITIONAL CONTEXT FROM USER]: ${EXTENSION_CONTEXT}
+
+"
+      EXTENSION_CONTEXT_SENT_B=true
+    fi
+  fi
+
+  msg+="${other_name}'s message:
+${other_response}
+
+Remaining messages: ${remaining}"
+
+  echo "$msg"
 }
 
 # Post-debate chat: continue conversation with one agent
@@ -686,63 +800,79 @@ if has_agreed "$agent_a_response" && has_agreed "$agent_b_response"; then
   if [[ "$DEBUG" == true ]]; then
     echo -e "${GRAY}Debug files: $tmpdir/${NC}"
   fi
-  post_debate_chat
-  exit 0
+  DEBATE_AGREED=true
 elif has_agreed "$agent_a_response"; then
   confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
 elif has_agreed "$agent_b_response"; then
   confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
 fi
 
-# Rounds 1+: Ping-pong (sequential, so session vars work)
-while [[ $msg_count -lt $MAX_MESSAGES ]]; do
-  remaining=$((MAX_MESSAGES - msg_count))
+# Skip to final cleanup if agreement was reached in round 0
+if [[ "$DEBATE_AGREED" == "true" ]]; then
+  post_debate_chat
+  print_resume_commands
+  exit 0
+fi
 
-  # Agent A gets Agent B's last response
-  agent_a_msg="${AGENT_B_NAME}'s message:
-$agent_b_response
+# Rounds 1+: Ping-pong with extension support
+# Outer loop allows extending the debate when limit is reached
+while true; do
+  # Inner loop: debate rounds
+  while [[ $msg_count -lt $MAX_MESSAGES ]]; do
+    remaining=$((MAX_MESSAGES - msg_count))
 
-Remaining messages: $((remaining - 1))"
+    # Agent A gets Agent B's last response
+    agent_a_msg=$(build_agent_message "$AGENT_B_NAME" "$agent_b_response" "$((remaining - 1))" "true")
 
-  start_spinner "${AGENT_A_NAME} is thinking..."
-  agent_a_response=$(call_agent_a "$agent_a_msg")
-  stop_spinner
-  msg_count=$((msg_count + 1))
-  print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_a_response"
+    start_spinner "${AGENT_A_NAME} is thinking..."
+    agent_a_response=$(call_agent_a "$agent_a_msg")
+    stop_spinner
+    msg_count=$((msg_count + 1))
+    print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_a_response"
 
-  if has_agreed "$agent_a_response"; then
-    confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
+    if has_agreed "$agent_a_response"; then
+      confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
+      if [[ "$DEBATE_AGREED" == "true" ]]; then
+        break 2
+      fi
+    fi
+
+    if [[ $msg_count -ge $MAX_MESSAGES ]]; then break; fi
+
+    # Agent B gets Agent A's last response
+    agent_b_msg=$(build_agent_message "$AGENT_A_NAME" "$agent_a_response" "$((MAX_MESSAGES - msg_count - 1))" "false")
+
+    start_spinner "${AGENT_B_NAME} is thinking..."
+    agent_b_response=$(call_agent_b "$agent_b_msg")
+    stop_spinner
+    msg_count=$((msg_count + 1))
+    print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_b_response"
+
+    if has_agreed "$agent_b_response"; then
+      confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
+      if [[ "$DEBATE_AGREED" == "true" ]]; then
+        break 2
+      fi
+    fi
+  done
+
+  # Check if we exited due to agreement
+  if [[ "$DEBATE_AGREED" == "true" ]]; then
+    break
   fi
 
-  if [[ $msg_count -ge $MAX_MESSAGES ]]; then break; fi
-
-  # Agent B gets Agent A's last response
-  agent_b_msg="${AGENT_A_NAME}'s message:
-$agent_a_response
-
-Remaining messages: $((MAX_MESSAGES - msg_count - 1))"
-
-  start_spinner "${AGENT_B_NAME} is thinking..."
-  agent_b_response=$(call_agent_b "$agent_b_msg")
-  stop_spinner
-  msg_count=$((msg_count + 1))
-  print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_b_response"
-
-  if has_agreed "$agent_b_response"; then
-    confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
+  # Offer extension
+  if ! prompt_extend_debate; then
+    # User declined extension - show final "DEBATE IS OVER" banner
+    echo ""
+    echo -e "${YELLOW}╔════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║          DEBATE IS OVER               ║${NC}"
+    echo -e "${YELLOW}╚════════════════════════════════════════╝${NC}"
+    break
   fi
+  # User chose to extend - continue outer loop
 done
 
-echo ""
-echo -e "${YELLOW}╔════════════════════════════════════════╗${NC}"
-echo -e "${YELLOW}║          DEBATE IS OVER               ║${NC}"
-echo -e "${YELLOW}╚════════════════════════════════════════╝${NC}"
-echo -e "No agreement after ${MAX_MESSAGES} messages."
-echo -e "${BOLD}Final positions:${NC}"
-echo -e "  ${AGENT_A_COLOR}${AGENT_A_NAME}:${NC} $(echo "$agent_a_response" | head -3)"
-echo -e "  ${AGENT_B_COLOR}${AGENT_B_NAME}:${NC} $(echo "$agent_b_response" | head -3)"
-if [[ "$DEBUG" == true ]]; then
-  echo -e "${GRAY}Debug files: $tmpdir/${NC}"
-fi
+# Final cleanup: post-debate chat and resume commands
 post_debate_chat
 print_resume_commands

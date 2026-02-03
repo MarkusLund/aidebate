@@ -53,6 +53,7 @@ After a debate concludes (either by agreement or reaching the message limit), yo
 | `--codex-model MODEL` | Codex model (`gpt-5.1-codex-mini`, `gpt-5.2-codex`) | interactive |
 | `--gemini-model MODEL` | Gemini model (`gemini-2.5-flash`, `gemini-3-flash-preview`) | interactive |
 | `--system-prompt-file F` | Custom system prompt from file | built-in |
+| `--output, -o FILE` | Save debate transcript to JSON file | off |
 | `--debug` | Keep raw API responses and show tmpdir | off |
 
 ### Examples
@@ -66,6 +67,28 @@ aidebate --claude-model sonnet --codex-model gpt-5.2-codex "Explain monads"
 
 # Short debate with debug output
 aidebate --max-rounds 4 --debug "Best sorting algorithm for nearly-sorted data"
+
+# Save transcript to file
+aidebate --output debate.json "Is functional programming better than OOP?"
+```
+
+## Transcript Format
+
+When using `--output`, the transcript is saved as JSON:
+
+```json
+{
+  "problem": "Your problem here",
+  "agents": {
+    "a": {"name": "Claude", "model": "sonnet"},
+    "b": {"name": "Codex", "model": "gpt-5.2-codex"}
+  },
+  "messages": [
+    {"agent": "a", "content": "...", "timestamp": "2024-01-15T10:30:00Z"},
+    {"agent": "b", "content": "...", "timestamp": "2024-01-15T10:31:00Z"}
+  ],
+  "conclusion": "The agreed upon conclusion"
+}
 ```
 
 ## License

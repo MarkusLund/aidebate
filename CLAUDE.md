@@ -28,16 +28,24 @@ The entire application is a single bash script (`ai-debate.sh`). Key sections:
 
 1. **Tool Detection (lines 5-42)**: Auto-detects available CLI tools (`claude`, `codex`, `gemini`) and assigns agent pairs by priority: Claude+Codex > Claude+Gemini > Codex+Gemini > single-agent fallback.
 
-2. **API Calls (lines 340-432)**: `_call_agent()` handles all three backends with session resumption. Each backend has different JSON output formats:
+2. **Utility Functions (lines 84-170)**: Input timeout wrapper (`read_with_timeout`), choice validation, spinner, response validation, and JSON validation with rate limit detection.
+
+4. **Model Selection (lines 252-285)**: Generic `select_model()` function handles all three backends with 30-second timeout.
+
+5. **Transcript Recording (lines 330-370)**: JSON transcript export via `--output` flag with `transcript_add()` and `write_transcript()` functions.
+
+6. **API Calls (lines 390-470)**: `_call_agent()` handles all three backends with session resumption, JSON validation, and rate limit detection. Each backend has different JSON output formats:
    - Claude: `{ session_id, result }`
    - Gemini: `{ session_id, response }`
    - Codex: NDJSON with `thread.started` and `item.completed` events
 
-3. **Round 0 Parallel Execution (lines 476-553)**: Both agents receive the problem simultaneously and respond in parallel using background processes.
+7. **Round 0 Parallel Execution (lines 550-620)**: Both agents receive the problem simultaneously and respond in parallel using background processes.
 
-4. **Agreement Detection (lines 556-607)**: Monitors for `AGREED:` prefix in responses. When one agent proposes agreement, the other is asked to confirm.
+8. **Agreement Detection (lines 655-720)**: Monitors for `AGREED:` prefix in responses. When one agent proposes agreement, the other is asked to confirm.
 
-5. **Session Management**: Each agent maintains a session ID for context continuity across the debate and optional post-debate chat.
+9. **Debate Extension (lines 730-790)**: Allows extending debates with additional messages and optional context injection when limit is reached (60-second timeout on prompts).
+
+10. **Session Management**: Each agent maintains a session ID for context continuity across the debate and optional post-debate chat.
 
 ## Dependencies
 

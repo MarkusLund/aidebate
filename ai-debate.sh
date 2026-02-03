@@ -72,6 +72,7 @@ MAX_MESSAGES=10
 API_TIMEOUT=60
 DEBUG=false
 SYSTEM_PROMPT_FILE=""
+OUTPUT_FILE=""
 BLUE='\033[1;34m'
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
@@ -80,6 +81,20 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Utility functions for user feedback
+
+# Read user input with timeout (prevents indefinite hangs)
+# Usage: read_with_timeout timeout_seconds prompt default_value
+# Sets REPLY variable with the result
+read_with_timeout() {
+  local timeout="$1" prompt="$2" default="$3"
+  printf "%s" "$prompt"
+  if ! read -t "$timeout" -r REPLY; then
+    REPLY="$default"
+    echo ""
+    echo -e "${GRAY}Timeout after ${timeout}s, using default: $default${NC}"
+  fi
+  [[ -z "$REPLY" ]] && REPLY="$default"
+}
 
 # Validate numeric choice is within valid range
 # Usage: validated=$(validate_choice "$input" min max default) || continue
@@ -134,6 +149,25 @@ validate_response() {
   return 0
 }
 
+# Validate JSON before parsing API responses
+validate_json() {
+  local raw="$1" label="$2"
+  if [[ -z "$raw" ]]; then
+    echo "ERROR: $label returned empty response." >&2
+    return 1
+  fi
+  if ! echo "$raw" | jq -e . >/dev/null 2>&1; then
+    # Check for rate limit patterns before generic error
+    if echo "$raw" | grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded"; then
+      echo "ERROR: $label hit rate limit. Wait a moment and try again." >&2
+    else
+      echo "ERROR: $label returned invalid JSON. Use --debug to inspect." >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
 # Parse CLI flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -151,6 +185,8 @@ while [[ $# -gt 0 ]]; do
       GEMINI_MODEL="$2"; shift 2 ;;
     --debug)
       DEBUG=true; shift ;;
+    --output|-o)
+      OUTPUT_FILE="$2"; shift 2 ;;
     --help|-h)
       echo "Usage: bash ai-debate.sh [OPTIONS] \"<problem>\""
       echo ""
@@ -161,6 +197,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --codex-model MODEL     Codex model (gpt-5.1-codex-mini, gpt-5.2-codex)"
       echo "  --gemini-model MODEL    Gemini model (gemini-2.5-flash, gemini-3-flash-preview)"
       echo "  --system-prompt-file F  Read system prompt from file"
+      echo "  --output, -o FILE       Save debate transcript to JSON file"
       echo "  --debug                 Keep raw API responses and show tmpdir"
       echo "  --help, -h              Show this help"
       exit 0
@@ -213,53 +250,38 @@ else
 fi
 
 # Interactive model selection (only for agents in use)
-if [[ "$AGENT_A_CMD" == "claude" || "$AGENT_B_CMD" == "claude" ]] && [[ -z "$CLAUDE_MODEL" ]]; then
-  echo "Select Claude model:"
-  for i in "${!CLAUDE_MODELS[@]}"; do
-    echo "  $((i+1))) ${CLAUDE_MODELS[$i]}"
-  done
-  while true; do
-    printf "Choice [1]: "
-    read -r choice
-    if validated=$(validate_choice "$choice" 1 "${#CLAUDE_MODELS[@]}" 1); then
-      CLAUDE_MODEL="${CLAUDE_MODELS[$((validated-1))]}"
-      echo -e "${GRAY}Selected Claude model: $CLAUDE_MODEL${NC}"
-      break
-    fi
-  done
-fi
+# 30 second timeout for model selection prompts
+MODEL_SELECT_TIMEOUT=30
 
-if [[ "$AGENT_A_CMD" == "codex" || "$AGENT_B_CMD" == "codex" ]] && [[ -z "$CODEX_MODEL" ]]; then
-  echo "Select Codex model:"
-  for i in "${!CODEX_MODELS[@]}"; do
-    echo "  $((i+1))) ${CODEX_MODELS[$i]}"
-  done
-  while true; do
-    printf "Choice [1]: "
-    read -r choice
-    if validated=$(validate_choice "$choice" 1 "${#CODEX_MODELS[@]}" 1); then
-      CODEX_MODEL="${CODEX_MODELS[$((validated-1))]}"
-      echo -e "${GRAY}Selected Codex model: $CODEX_MODEL${NC}"
-      break
-    fi
-  done
-fi
+# Generic model selection function
+# Usage: select_model VAR_NAME "Display Name" model1 model2 ...
+select_model() {
+  local var_name="$1" display_name="$2"
+  shift 2
+  local models=("$@")
+  local current_val="${!var_name}"
 
-if [[ "$AGENT_A_CMD" == "gemini" || "$AGENT_B_CMD" == "gemini" ]] && [[ -z "$GEMINI_MODEL" ]]; then
-  echo "Select Gemini model:"
-  for i in "${!GEMINI_MODELS[@]}"; do
-    echo "  $((i+1))) ${GEMINI_MODELS[$i]}"
+  # Skip if already set via CLI
+  [[ -n "$current_val" ]] && return
+
+  echo "Select $display_name model:"
+  for i in "${!models[@]}"; do
+    echo "  $((i+1))) ${models[$i]}"
   done
   while true; do
-    printf "Choice [1]: "
-    read -r choice
-    if validated=$(validate_choice "$choice" 1 "${#GEMINI_MODELS[@]}" 1); then
-      GEMINI_MODEL="${GEMINI_MODELS[$((validated-1))]}"
-      echo -e "${GRAY}Selected Gemini model: $GEMINI_MODEL${NC}"
+    read_with_timeout "$MODEL_SELECT_TIMEOUT" "Choice [1]: " "1"
+    if validated=$(validate_choice "$REPLY" 1 "${#models[@]}" 1); then
+      printf -v "$var_name" '%s' "${models[$((validated-1))]}"
+      echo -e "${GRAY}Selected $display_name model: ${!var_name}${NC}"
       break
     fi
   done
-fi
+}
+
+# Select models for agents in use
+[[ "$AGENT_A_CMD" == "claude" || "$AGENT_B_CMD" == "claude" ]] && select_model CLAUDE_MODEL "Claude" "${CLAUDE_MODELS[@]}"
+[[ "$AGENT_A_CMD" == "codex" || "$AGENT_B_CMD" == "codex" ]] && select_model CODEX_MODEL "Codex" "${CODEX_MODELS[@]}"
+[[ "$AGENT_A_CMD" == "gemini" || "$AGENT_B_CMD" == "gemini" ]] && select_model GEMINI_MODEL "Gemini" "${GEMINI_MODELS[@]}"
 
 SYSTEM_PROMPT="You are participating in a critical debate with another AI agent to solve a problem.
 
@@ -295,15 +317,57 @@ EXTENSION_CONTEXT=""
 EXTENSION_CONTEXT_SENT_A=false
 EXTENSION_CONTEXT_SENT_B=false
 DEBATE_AGREED=false
+DEBATE_CONCLUSION=""
+
+# Transcript recording for --output
+TRANSCRIPT_MESSAGES="[]"
+
+# Add a message to the transcript
+# Usage: transcript_add "agent_id" "content"
+transcript_add() {
+  local agent="$1" content="$2"
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  TRANSCRIPT_MESSAGES=$(echo "$TRANSCRIPT_MESSAGES" | jq --arg agent "$agent" --arg content "$content" --arg ts "$timestamp" \
+    '. + [{"agent": $agent, "content": $content, "timestamp": $ts}]')
+}
+
+# Write transcript to output file
+write_transcript() {
+  [[ -z "$OUTPUT_FILE" ]] && return
+  local conclusion="${DEBATE_CONCLUSION:-No agreement reached}"
+  jq -n \
+    --arg problem "$PROBLEM" \
+    --arg agent_a_name "$AGENT_A_NAME" \
+    --arg agent_a_model "$(_agent_model "$AGENT_A_CMD")" \
+    --arg agent_b_name "$AGENT_B_NAME" \
+    --arg agent_b_model "$(_agent_model "$AGENT_B_CMD")" \
+    --arg conclusion "$conclusion" \
+    --argjson messages "$TRANSCRIPT_MESSAGES" \
+    '{
+      "problem": $problem,
+      "agents": {
+        "a": {"name": $agent_a_name, "model": $agent_a_model},
+        "b": {"name": $agent_b_name, "model": $agent_b_model}
+      },
+      "messages": $messages,
+      "conclusion": $conclusion
+    }' > "$OUTPUT_FILE"
+  echo -e "${GRAY}Transcript saved to: $OUTPUT_FILE${NC}"
+}
 
 # Temp dir for round 0 communication and debug output
 tmpdir=$(mktemp -d)
 if [[ "$DEBUG" == true ]]; then
   echo -e "${GRAY}Debug: tmpdir=$tmpdir${NC}"
-  trap 'stop_spinner 2>/dev/null' EXIT
-else
-  trap 'stop_spinner 2>/dev/null; rm -rf "$tmpdir"' EXIT
 fi
+
+# Unified cleanup function
+cleanup() {
+  stop_spinner 2>/dev/null
+  [[ "$DEBUG" != true ]] && rm -rf "$tmpdir"
+}
+trap cleanup EXIT
 
 debug_save() {
   if [[ "$DEBUG" == true ]]; then
@@ -371,6 +435,7 @@ _call_agent() {
       return 1
     fi
     debug_save "$label" "$raw"
+    validate_json "$raw" "$label" || return 1
     if [[ -z "$session" ]]; then
       local new_sid
       new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
@@ -392,6 +457,7 @@ _call_agent() {
       return 1
     fi
     debug_save "$label" "$raw"
+    validate_json "$raw" "$label" || return 1
     if [[ -z "$session" ]]; then
       local new_sid
       new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
@@ -422,6 +488,11 @@ _call_agent() {
       fi
     fi
     debug_save "$label" "$raw"
+    # Codex uses NDJSON - check for rate limits in raw output
+    if [[ -z "$raw" ]] || echo "$raw" | grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded"; then
+      echo "ERROR: $label hit rate limit. Wait a moment and try again." >&2
+      return 1
+    fi
     if [[ -z "$session" ]]; then
       local new_sid
       new_sid=$(echo "$raw" | jq -r 'select(.type=="thread.started") | .thread_id // empty' 2>/dev/null | head -1) || true
@@ -430,7 +501,7 @@ _call_agent() {
     local codex_text
     codex_text=$(echo "$raw" | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty' 2>/dev/null | tail -1) || true
     if [[ -z "$codex_text" ]]; then
-      echo "ERROR: $label returned no parseable response. Re-run with --debug to inspect raw output." >&2
+      echo "ERROR: $label returned no parsable response. Re-run with --debug to inspect raw output." >&2
       return 1
     fi
     echo "$codex_text"
@@ -564,7 +635,9 @@ fi
 echo -e "${GRAY}Round 0 complete${NC}"
 
 print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" 1 $((MAX_MESSAGES - msg_count)) "$agent_a_response"
+transcript_add "a" "$agent_a_response"
 print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" 2 $((MAX_MESSAGES - msg_count)) "$agent_b_response"
+transcript_add "b" "$agent_b_response"
 
 # Extract AGREED conclusion from a response
 extract_agreed() {
@@ -577,9 +650,9 @@ has_agreed() {
 }
 
 # When one agent says AGREED, ask the other to confirm
-# Args: proposer_name proposal confirmer_name confirmer_call_fn confirmer_color confirmer_response_var
+# Args: proposer_name proposal confirmer_name confirmer_call_fn confirmer_color confirmer_response_var confirmer_id
 confirm_agreement() {
-  local proposer="$1" proposal="$2" confirmer="$3" call_fn="$4" confirm_color="$5" response_var="$6"
+  local proposer="$1" proposal="$2" confirmer="$3" call_fn="$4" confirm_color="$5" response_var="$6" confirmer_id="$7"
   local conclusion
   conclusion=$(extract_agreed "$proposal")
 
@@ -605,6 +678,7 @@ Only respond with \"AGREED: <conclusion>\" if you are fully satisfied this is a 
   msg_count=$((msg_count + 1))
 
   print_msg "$confirm_color" "$confirmer" "$msg_count" $((MAX_MESSAGES - msg_count)) "$confirm_response"
+  transcript_add "$confirmer_id" "$confirm_response"
 
   if has_agreed "$confirm_response"; then
     local final
@@ -619,6 +693,7 @@ Only respond with \"AGREED: <conclusion>\" if you are fully satisfied this is a 
       echo -e "${GRAY}Debug files: $tmpdir/${NC}"
     fi
     DEBATE_AGREED=true
+    DEBATE_CONCLUSION="$final"
     return 0
   fi
 
@@ -648,6 +723,9 @@ print_resume_commands() {
 
 # Prompt user to extend the debate with more messages
 # Returns 0 if extending, 1 if not
+# 60 second timeout for extension prompts
+EXTENSION_PROMPT_TIMEOUT=60
+
 prompt_extend_debate() {
   echo ""
   echo -e "${YELLOW}╔════════════════════════════════════════╗${NC}"
@@ -662,25 +740,25 @@ prompt_extend_debate() {
   fi
 
   echo ""
-  printf "Would you like to extend the debate with more messages? (y/n) "
-  read -r extend_choice
-  if [[ "$extend_choice" != "y" && "$extend_choice" != "Y" ]]; then
+  read_with_timeout "$EXTENSION_PROMPT_TIMEOUT" "Would you like to extend the debate with more messages? (y/n) " "n"
+  if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
     return 1
   fi
 
   # Get number of additional messages
-  printf "How many additional messages? [5]: "
-  read -r additional_msgs
-  additional_msgs=${additional_msgs:-5}
+  read_with_timeout "$EXTENSION_PROMPT_TIMEOUT" "How many additional messages? [5]: " "5"
+  local additional_msgs="$REPLY"
   if ! [[ "$additional_msgs" =~ ^[0-9]+$ ]] || [[ "$additional_msgs" -lt 1 ]]; then
     echo -e "${YELLOW}Invalid number, using 5${NC}"
     additional_msgs=5
   fi
 
+  # Clear any previous extension context before prompting for new
+  EXTENSION_CONTEXT=""
+
   # Option to inject context
-  printf "Would you like to inject additional context/guidance for both agents? (y/n) "
-  read -r inject_choice
-  if [[ "$inject_choice" == "y" || "$inject_choice" == "Y" ]]; then
+  read_with_timeout "$EXTENSION_PROMPT_TIMEOUT" "Would you like to inject additional context/guidance for both agents? (y/n) " "n"
+  if [[ "$REPLY" == "y" || "$REPLY" == "Y" ]]; then
     echo "Enter additional context (or 'edit' to open an editor):"
     printf "> "
     read -r context_input
@@ -791,24 +869,26 @@ post_debate_chat() {
 
 # Check round 0 for early agreement
 if has_agreed "$agent_a_response" && has_agreed "$agent_b_response"; then
+  DEBATE_CONCLUSION=$(extract_agreed "$agent_a_response")
   echo ""
   echo -e "${YELLOW}╔════════════════════════════════════════╗${NC}"
   echo -e "${YELLOW}║          AGREEMENT REACHED            ║${NC}"
   echo -e "${YELLOW}╚════════════════════════════════════════╝${NC}"
-  echo -e "${BOLD}Conclusion:${NC} $(extract_agreed "$agent_a_response")"
+  echo -e "${BOLD}Conclusion:${NC} $DEBATE_CONCLUSION"
   echo -e "${GRAY}Messages used: ${msg_count}/${MAX_MESSAGES}${NC}"
   if [[ "$DEBUG" == true ]]; then
     echo -e "${GRAY}Debug files: $tmpdir/${NC}"
   fi
   DEBATE_AGREED=true
 elif has_agreed "$agent_a_response"; then
-  confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
+  confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response "b"
 elif has_agreed "$agent_b_response"; then
-  confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
+  confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response "a"
 fi
 
 # Skip to final cleanup if agreement was reached in round 0
 if [[ "$DEBATE_AGREED" == "true" ]]; then
+  write_transcript
   post_debate_chat
   print_resume_commands
   exit 0
@@ -829,9 +909,10 @@ while true; do
     stop_spinner
     msg_count=$((msg_count + 1))
     print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_a_response"
+    transcript_add "a" "$agent_a_response"
 
     if has_agreed "$agent_a_response"; then
-      confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response
+      confirm_agreement "$AGENT_A_NAME" "$agent_a_response" "$AGENT_B_NAME" call_agent_b "$AGENT_B_COLOR" agent_b_response "b"
       if [[ "$DEBATE_AGREED" == "true" ]]; then
         break 2
       fi
@@ -847,9 +928,10 @@ while true; do
     stop_spinner
     msg_count=$((msg_count + 1))
     print_msg "$AGENT_B_COLOR" "$AGENT_B_NAME" "$msg_count" $((MAX_MESSAGES - msg_count)) "$agent_b_response"
+    transcript_add "b" "$agent_b_response"
 
     if has_agreed "$agent_b_response"; then
-      confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response
+      confirm_agreement "$AGENT_B_NAME" "$agent_b_response" "$AGENT_A_NAME" call_agent_a "$AGENT_A_COLOR" agent_a_response "a"
       if [[ "$DEBATE_AGREED" == "true" ]]; then
         break 2
       fi
@@ -873,6 +955,7 @@ while true; do
   # User chose to extend - continue outer loop
 done
 
-# Final cleanup: post-debate chat and resume commands
+# Final cleanup: write transcript, post-debate chat, and resume commands
+write_transcript
 post_debate_chat
 print_resume_commands

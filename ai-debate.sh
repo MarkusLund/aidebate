@@ -139,6 +139,99 @@ stop_spinner() {
   fi
 }
 
+# Dual spinner for Round 0 parallel execution
+DUAL_SPINNER_PID=""
+DUAL_SPINNER_AGENT_A=""
+DUAL_SPINNER_AGENT_B=""
+DUAL_SPINNER_COLOR_A=""
+DUAL_SPINNER_COLOR_B=""
+
+# Start dual spinner showing status for both agents
+# Usage: start_dual_spinner agent_a_name agent_b_name agent_a_color agent_b_color
+start_dual_spinner() {
+  DUAL_SPINNER_AGENT_A="$1"
+  DUAL_SPINNER_AGENT_B="$2"
+  DUAL_SPINNER_COLOR_A="$3"
+  DUAL_SPINNER_COLOR_B="$4"
+
+  # Non-TTY: just print static messages
+  if [[ ! -t 1 ]]; then
+    echo -e "${GRAY}Round 0: Both agents thinking in parallel...${NC}"
+    echo -e "${GRAY}  ${DUAL_SPINNER_AGENT_A}: working...${NC}"
+    echo -e "${GRAY}  ${DUAL_SPINNER_AGENT_B}: working...${NC}"
+    return
+  fi
+
+  # Print header and two status lines
+  echo -e "${GRAY}Round 0: Both agents thinking in parallel...${NC}"
+  echo ""
+  echo ""
+
+  # Spawn background process to animate spinners
+  (
+    local spinners=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local idx=0
+    local done_a=false done_b=false
+
+    while true; do
+      local char="${spinners[$idx]}"
+      idx=$(( (idx + 1) % 10 ))
+
+      # Check completion status
+      [[ -f "$tmpdir/agent_a_r0_exit" ]] && done_a=true
+      [[ -f "$tmpdir/agent_b_r0_exit" ]] && done_b=true
+
+      # Build status for agent A
+      local status_a
+      if $done_a; then
+        status_a="${DUAL_SPINNER_COLOR_A}  ✓ ${DUAL_SPINNER_AGENT_A}${NC}"
+      else
+        status_a="${GRAY}  ${char} ${DUAL_SPINNER_AGENT_A}${NC}"
+      fi
+
+      # Build status for agent B
+      local status_b
+      if $done_b; then
+        status_b="${DUAL_SPINNER_COLOR_B}  ✓ ${DUAL_SPINNER_AGENT_B}${NC}"
+      else
+        status_b="${GRAY}  ${char} ${DUAL_SPINNER_AGENT_B}${NC}"
+      fi
+
+      # Move cursor up 2 lines, print status, clear to end of line
+      printf "\033[2A"
+      printf "\r\033[K"
+      echo -e "$status_a"
+      printf "\r\033[K"
+      echo -e "$status_b"
+
+      sleep 0.1
+    done
+  ) &
+  DUAL_SPINNER_PID=$!
+}
+
+# Stop dual spinner and show final state
+stop_dual_spinner() {
+  if [[ -n "$DUAL_SPINNER_PID" ]]; then
+    kill "$DUAL_SPINNER_PID" 2>/dev/null || true
+    wait "$DUAL_SPINNER_PID" 2>/dev/null || true
+    DUAL_SPINNER_PID=""
+
+    # Non-TTY: just print completion
+    if [[ ! -t 1 ]]; then
+      echo -e "${GRAY}Round 0 complete${NC}"
+      return
+    fi
+
+    # Print final state with checkmarks
+    printf "\033[2A"
+    printf "\r\033[K"
+    echo -e "${DUAL_SPINNER_COLOR_A}  ✓ ${DUAL_SPINNER_AGENT_A}${NC}"
+    printf "\r\033[K"
+    echo -e "${DUAL_SPINNER_COLOR_B}  ✓ ${DUAL_SPINNER_AGENT_B}${NC}"
+  fi
+}
+
 # Warn on empty API responses
 validate_response() {
   local response="$1" agent="$2"
@@ -367,6 +460,7 @@ fi
 # Unified cleanup function
 cleanup() {
   stop_spinner 2>/dev/null
+  stop_dual_spinner 2>/dev/null
   [[ "$DEBUG" != true ]] && rm -rf "$tmpdir"
 }
 trap cleanup EXIT
@@ -559,7 +653,6 @@ $PROBLEM
 Remaining messages: $MAX_MESSAGES"
 
 echo ""
-start_spinner "Round 0: Both agents thinking in parallel..."
 
 # Helper to build round 0 command for an agent
 _r0_cmd() {
@@ -587,13 +680,16 @@ _r0_parse() {
   fi
 }
 
+# Start dual spinner before launching background processes
+start_dual_spinner "$AGENT_A_NAME" "$AGENT_B_NAME" "$AGENT_A_COLOR" "$AGENT_B_COLOR"
+
 # Run both in background, writing raw output to files
 pid_a=$(_r0_cmd "$AGENT_A_CMD" "$tmpdir/agent_a_raw" "$tmpdir/agent_a_r0_err" "$tmpdir/agent_a_r0_exit")
 pid_b=$(_r0_cmd "$AGENT_B_CMD" "$tmpdir/agent_b_raw" "$tmpdir/agent_b_r0_err" "$tmpdir/agent_b_r0_exit")
 
 wait $pid_a 2>/dev/null || true
 wait $pid_b 2>/dev/null || true
-stop_spinner
+stop_dual_spinner
 
 agent_a_exit=$(cat "$tmpdir/agent_a_r0_exit" 2>/dev/null || echo "1")
 agent_b_exit=$(cat "$tmpdir/agent_b_r0_exit" 2>/dev/null || echo "1")
@@ -633,8 +729,6 @@ fi
 if ! validate_response "$agent_b_response" "$AGENT_B_NAME"; then
   exit 1
 fi
-
-echo -e "${GRAY}Round 0 complete${NC}"
 
 print_msg "$AGENT_A_COLOR" "$AGENT_A_NAME" 1 $((MAX_MESSAGES - msg_count)) "$agent_a_response"
 transcript_add "a" "$agent_a_response"

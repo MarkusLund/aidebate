@@ -94,6 +94,7 @@ read_with_timeout() {
     echo -e "${GRAY}Timeout after ${timeout}s, using default: $default${NC}"
   fi
   [[ -z "$REPLY" ]] && REPLY="$default"
+  return 0
 }
 
 # Validate numeric choice is within valid range
@@ -258,7 +259,8 @@ MODEL_SELECT_TIMEOUT=30
 select_model() {
   local var_name="$1" display_name="$2"
   shift 2
-  local models=("$@")
+  local models
+  models=("$@")
   local current_val="${!var_name}"
 
   # Skip if already set via CLI

@@ -836,18 +836,12 @@ prompt_extend_debate() {
   fi
 
   echo ""
-  read_with_timeout "$EXTENSION_PROMPT_TIMEOUT" "Would you like to extend the debate with more messages? (y/n) " "n"
+  read_with_timeout "$EXTENSION_PROMPT_TIMEOUT" "Continue for 5 more messages? (y/n) " "n"
   if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
     return 1
   fi
 
-  # Get number of additional messages
-  read_with_timeout "$EXTENSION_PROMPT_TIMEOUT" "How many additional messages? [5]: " "5"
-  local additional_msgs="$REPLY"
-  if ! [[ "$additional_msgs" =~ ^[0-9]+$ ]] || [[ "$additional_msgs" -lt 1 ]]; then
-    echo -e "${YELLOW}Invalid number, using 5${NC}"
-    additional_msgs=5
-  fi
+  local additional_msgs=5
 
   # Clear any previous extension context before prompting for new
   EXTENSION_CONTEXT=""
@@ -914,53 +908,95 @@ Remaining messages: ${remaining}"
   echo "$msg"
 }
 
-# Post-debate chat: continue conversation with one agent
-post_debate_chat() {
+# Prompt user to export a report of the conversation
+prompt_export_report() {
   echo ""
-  echo -e "${GRAY}Would you like to continue chatting with one of the agents? (y/n)${NC}"
-  read -r continue_chat
-  [[ "$continue_chat" != "y" && "$continue_chat" != "Y" ]] && return
-
-  # Agent selection
-  echo "Select an agent to chat with:"
-  echo "  1) $AGENT_A_NAME"
-  echo "  2) $AGENT_B_NAME"
-  printf "Choice [1]: "
-  read -r agent_choice
-  agent_choice=${agent_choice:-1}
-
-  local chat_agent_name chat_agent_color call_fn
-  if [[ "$agent_choice" == "2" ]]; then
-    chat_agent_name="$AGENT_B_NAME"
-    chat_agent_color="$AGENT_B_COLOR"
-    call_fn=call_agent_b
-  else
-    chat_agent_name="$AGENT_A_NAME"
-    chat_agent_color="$AGENT_A_COLOR"
-    call_fn=call_agent_a
+  read_with_timeout 60 "Would you like to export a report of the conversation? (y/n) " "n"
+  if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
+    return
   fi
 
-  echo ""
-  echo -e "${GRAY}Chatting with ${chat_agent_name}. Type 'exit' or 'quit' to end.${NC}"
+  if [[ -z "$OUTPUT_FILE" ]]; then
+    local default_name="debate-report-$(date +%Y-%m-%d-%H%M%S).json"
+    read_with_timeout 60 "Filename [$default_name]: " "$default_name"
+    OUTPUT_FILE="$REPLY"
+  fi
 
+  write_transcript
+}
+
+# Post-debate interactive menu
+post_debate_menu() {
   while true; do
     echo ""
-    printf "${BOLD}You:${NC} "
-    read -r user_input
+    echo "What would you like to do?"
+    echo "  1) Chat with an agent"
+    echo "  2) Export report"
+    echo "  3) Exit"
+    read_with_timeout 60 "Choice [3]: " "3"
 
-    [[ -z "$user_input" || "$user_input" == "exit" || "$user_input" == "quit" ]] && break
+    case "$REPLY" in
+      1)
+        # Agent selection
+        echo ""
+        echo "Select an agent to chat with:"
+        echo "  1) $AGENT_A_NAME"
+        echo "  2) $AGENT_B_NAME"
+        printf "Choice [1]: "
+        read -r agent_choice
+        agent_choice=${agent_choice:-1}
 
-    start_spinner "${chat_agent_name} is thinking..."
-    local response
-    response=$($call_fn "$user_input")
-    stop_spinner
+        local chat_agent_name chat_agent_color chat_agent_id call_fn
+        if [[ "$agent_choice" == "2" ]]; then
+          chat_agent_name="$AGENT_B_NAME"
+          chat_agent_color="$AGENT_B_COLOR"
+          chat_agent_id="b"
+          call_fn=call_agent_b
+        else
+          chat_agent_name="$AGENT_A_NAME"
+          chat_agent_color="$AGENT_A_COLOR"
+          chat_agent_id="a"
+          call_fn=call_agent_a
+        fi
 
-    echo ""
-    echo -e "${chat_agent_color}━━━ ${chat_agent_name} ━━━${NC}"
-    echo -e "${chat_agent_color}${response}${NC}"
+        echo ""
+        echo -e "${GRAY}Chatting with ${chat_agent_name}. Type 'exit' or 'quit' to end.${NC}"
+
+        while true; do
+          echo ""
+          printf "${BOLD}You:${NC} "
+          read -r user_input
+
+          [[ -z "$user_input" || "$user_input" == "exit" || "$user_input" == "quit" ]] && break
+
+          transcript_add "user" "$user_input"
+
+          start_spinner "${chat_agent_name} is thinking..."
+          local response
+          response=$($call_fn "$user_input")
+          stop_spinner
+
+          transcript_add "$chat_agent_id" "$response"
+
+          echo ""
+          echo -e "${chat_agent_color}━━━ ${chat_agent_name} ━━━${NC}"
+          echo -e "${chat_agent_color}${response}${NC}"
+        done
+
+        echo -e "${GRAY}Chat ended.${NC}"
+        ;;
+      2)
+        prompt_export_report
+        ;;
+      *)
+        # Save transcript with all chat turns before exiting
+        if [[ -n "$OUTPUT_FILE" ]]; then
+          write_transcript
+        fi
+        break
+        ;;
+    esac
   done
-
-  echo -e "${GRAY}Chat ended.${NC}"
 }
 
 # Check round 0 for early agreement
@@ -984,8 +1020,7 @@ fi
 
 # Skip to final cleanup if agreement was reached in round 0
 if [[ "$DEBATE_AGREED" == "true" ]]; then
-  write_transcript
-  post_debate_chat
+  post_debate_menu
   print_resume_commands
   exit 0
 fi
@@ -1051,7 +1086,6 @@ while true; do
   # User chose to extend - continue outer loop
 done
 
-# Final cleanup: write transcript, post-debate chat, and resume commands
-write_transcript
-post_debate_chat
+# Final cleanup: post-debate menu and resume commands
+post_debate_menu
 print_resume_commands

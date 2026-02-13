@@ -70,6 +70,8 @@ GEMINI_MODEL=""
 
 MAX_MESSAGES=10
 API_TIMEOUT=60
+MAX_RETRIES=3
+RETRY_BASE_DELAY=5
 DEBUG=false
 SYSTEM_PROMPT_FILE=""
 OUTPUT_FILE=""
@@ -137,6 +139,29 @@ stop_spinner() {
     printf "\r\033[K"
     SPINNER_PID=""
   fi
+}
+
+# Display a countdown during backoff waits
+# Usage: countdown_wait seconds label
+countdown_wait() {
+  local secs="$1" label="$2"
+  if [[ -t 1 ]]; then
+    for (( i=secs; i>0; i-- )); do
+      printf "\r${YELLOW}${label}: retrying in ${i}s...${NC}\033[K"
+      sleep 1
+    done
+    printf "\r\033[K"
+  else
+    echo -e "${YELLOW}${label}: retrying in ${secs}s...${NC}"
+    sleep "$secs"
+  fi
+}
+
+# Check if a file contains rate limit indicators
+# Usage: _is_rate_limited file
+_is_rate_limited() {
+  local file="$1"
+  [[ -f "$file" ]] && grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded" "$file"
 }
 
 # Dual spinner for Round 0 parallel execution
@@ -253,7 +278,8 @@ validate_json() {
   if ! echo "$raw" | jq -e . >/dev/null 2>&1; then
     # Check for rate limit patterns before generic error
     if echo "$raw" | grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded"; then
-      echo "ERROR: $label hit rate limit. Wait a moment and try again." >&2
+      echo "ERROR: $label hit rate limit." >&2
+      return 2
     else
       echo "ERROR: $label returned invalid JSON. Use --debug to inspect." >&2
     fi
@@ -269,6 +295,8 @@ while [[ $# -gt 0 ]]; do
       MAX_MESSAGES="$2"; shift 2 ;;
     --timeout)
       API_TIMEOUT="$2"; shift 2 ;;
+    --max-retries)
+      MAX_RETRIES="$2"; shift 2 ;;
     --system-prompt-file)
       SYSTEM_PROMPT_FILE="$2"; shift 2 ;;
     --claude-model)
@@ -287,6 +315,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --max-rounds N          Max number of messages (default: 10)"
       echo "  --timeout N             API timeout in seconds (default: 60)"
+      echo "  --max-retries N         Max retries on rate limit (default: 3)"
       echo "  --claude-model MODEL    Claude model (haiku, sonnet, opus)"
       echo "  --codex-model MODEL     Codex model (gpt-5.1-codex-mini, gpt-5.2-codex)"
       echo "  --gemini-model MODEL    Gemini model (gemini-2.5-flash, gemini-3-flash-preview)"
@@ -515,93 +544,158 @@ _call_agent() {
   local cmd="$1" session_var="$2" label="$3" msg="$4"
   local session="${!session_var}"
   local raw err_file="$tmpdir/${label}_err"
+  local attempt=0 rate_limited=false
 
-  if [[ "$cmd" == "claude" ]]; then
-    local args=(claude -p "$msg" --model "$CLAUDE_MODEL" --output-format json)
-    if [[ -n "$session" ]]; then
-      args+=(--resume "$session")
-    fi
-    if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
-      local exit_code=$?
-      if [[ $exit_code -eq 124 ]]; then
-        echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
-      else
-        echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+  while true; do
+    rate_limited=false
+
+    if [[ "$cmd" == "claude" ]]; then
+      local args=(claude -p "$msg" --model "$CLAUDE_MODEL" --output-format json)
+      if [[ -n "$session" ]]; then
+        args+=(--resume "$session")
       fi
-      return 1
-    fi
-    debug_save "$label" "$raw"
-    validate_json "$raw" "$label" || return 1
-    if [[ -z "$session" ]]; then
-      local new_sid
-      new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
-      printf -v "$session_var" '%s' "$new_sid"
-    fi
-    echo "$raw" | jq -r '.result // empty' 2>/dev/null
-  elif [[ "$cmd" == "gemini" ]]; then
-    local args=(gemini -p "$msg" -o json -m "$GEMINI_MODEL")
-    if [[ -n "$session" ]]; then
-      args+=(--resume "$session")
-    fi
-    if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
-      local exit_code=$?
-      if [[ $exit_code -eq 124 ]]; then
-        echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
-      else
-        echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
-      fi
-      return 1
-    fi
-    debug_save "$label" "$raw"
-    validate_json "$raw" "$label" || return 1
-    if [[ -z "$session" ]]; then
-      local new_sid
-      new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
-      printf -v "$session_var" '%s' "$new_sid"
-    fi
-    echo "$raw" | jq -r '.response // empty' 2>/dev/null
-  else
-    # codex
-    if [[ -z "$session" ]]; then
-      if ! raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
+      if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
         local exit_code=$?
         if [[ $exit_code -eq 124 ]]; then
           echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
+          return 1
+        elif _is_rate_limited "$err_file"; then
+          rate_limited=true
         else
           echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+          return 1
         fi
-        return 1
+      fi
+      if [[ "$rate_limited" != true ]]; then
+        debug_save "$label" "$raw"
+        local vj_exit=0
+        if validate_json "$raw" "$label"; then
+          vj_exit=0
+        else
+          vj_exit=$?
+        fi
+        if [[ $vj_exit -eq 2 ]]; then
+          rate_limited=true
+        elif [[ $vj_exit -ne 0 ]]; then
+          return 1
+        fi
+      fi
+      if [[ "$rate_limited" != true ]]; then
+        if [[ -z "$session" ]]; then
+          local new_sid
+          new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
+          printf -v "$session_var" '%s' "$new_sid"
+        fi
+        echo "$raw" | jq -r '.result // empty' 2>/dev/null
+        return 0
+      fi
+    elif [[ "$cmd" == "gemini" ]]; then
+      local args=(gemini -p "$msg" -o json -m "$GEMINI_MODEL")
+      if [[ -n "$session" ]]; then
+        args+=(--resume "$session")
+      fi
+      if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
+        local exit_code=$?
+        if [[ $exit_code -eq 124 ]]; then
+          echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
+          return 1
+        elif _is_rate_limited "$err_file"; then
+          rate_limited=true
+        else
+          echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+          return 1
+        fi
+      fi
+      if [[ "$rate_limited" != true ]]; then
+        debug_save "$label" "$raw"
+        local vj_exit=0
+        if validate_json "$raw" "$label"; then
+          vj_exit=0
+        else
+          vj_exit=$?
+        fi
+        if [[ $vj_exit -eq 2 ]]; then
+          rate_limited=true
+        elif [[ $vj_exit -ne 0 ]]; then
+          return 1
+        fi
+      fi
+      if [[ "$rate_limited" != true ]]; then
+        if [[ -z "$session" ]]; then
+          local new_sid
+          new_sid=$(echo "$raw" | jq -r '.session_id // empty' 2>/dev/null) || true
+          printf -v "$session_var" '%s' "$new_sid"
+        fi
+        echo "$raw" | jq -r '.response // empty' 2>/dev/null
+        return 0
       fi
     else
-      if ! raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
-        local exit_code=$?
-        if [[ $exit_code -eq 124 ]]; then
-          echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
-        else
-          echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+      # codex
+      if [[ -z "$session" ]]; then
+        if ! raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
+          local exit_code=$?
+          if [[ $exit_code -eq 124 ]]; then
+            echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
+            return 1
+          elif _is_rate_limited "$err_file"; then
+            rate_limited=true
+          else
+            echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+            return 1
+          fi
         fi
-        return 1
+      else
+        if ! raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
+          local exit_code=$?
+          if [[ $exit_code -eq 124 ]]; then
+            echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
+            return 1
+          elif _is_rate_limited "$err_file"; then
+            rate_limited=true
+          else
+            echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+            return 1
+          fi
+        fi
+      fi
+      if [[ "$rate_limited" != true ]]; then
+        debug_save "$label" "$raw"
+        if [[ -z "$raw" ]]; then
+          echo "ERROR: $label returned empty response." >&2
+          return 1
+        fi
+        if echo "$raw" | grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded"; then
+          rate_limited=true
+        fi
+      fi
+      if [[ "$rate_limited" != true ]]; then
+        if [[ -z "$session" ]]; then
+          local new_sid
+          new_sid=$(echo "$raw" | jq -r 'select(.type=="thread.started") | .thread_id // empty' 2>/dev/null | head -1) || true
+          printf -v "$session_var" '%s' "$new_sid"
+        fi
+        local codex_text
+        codex_text=$(echo "$raw" | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty' 2>/dev/null | tail -1) || true
+        if [[ -z "$codex_text" ]]; then
+          echo "ERROR: $label returned no parsable response. Re-run with --debug to inspect raw output." >&2
+          return 1
+        fi
+        echo "$codex_text"
+        return 0
       fi
     fi
-    debug_save "$label" "$raw"
-    # Codex uses NDJSON - check for rate limits in raw output
-    if [[ -z "$raw" ]] || echo "$raw" | grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded"; then
-      echo "ERROR: $label hit rate limit. Wait a moment and try again." >&2
+
+    # Rate limited — retry with exponential backoff
+    if [[ $attempt -ge $MAX_RETRIES ]]; then
+      echo "ERROR: $label rate limited, gave up after $MAX_RETRIES retries." >&2
       return 1
     fi
-    if [[ -z "$session" ]]; then
-      local new_sid
-      new_sid=$(echo "$raw" | jq -r 'select(.type=="thread.started") | .thread_id // empty' 2>/dev/null | head -1) || true
-      printf -v "$session_var" '%s' "$new_sid"
-    fi
-    local codex_text
-    codex_text=$(echo "$raw" | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty' 2>/dev/null | tail -1) || true
-    if [[ -z "$codex_text" ]]; then
-      echo "ERROR: $label returned no parsable response. Re-run with --debug to inspect raw output." >&2
-      return 1
-    fi
-    echo "$codex_text"
-  fi
+    attempt=$((attempt + 1))
+    local delay=$(( RETRY_BASE_DELAY * (1 << (attempt - 1)) ))
+    stop_spinner >&2
+    countdown_wait "$delay" "$label" >&2
+    start_spinner "Retrying $label..." >&2
+  done
 }
 
 call_agent_a() {
@@ -654,16 +748,53 @@ Remaining messages: $MAX_MESSAGES"
 
 echo ""
 
-# Helper to build round 0 command for an agent
+# Helper to build round 0 command for an agent (with retry for rate limits)
 _r0_cmd() {
   local cmd="$1" outfile="$2" errfile="$3" exitfile="$4"
-  if [[ "$cmd" == "claude" ]]; then
-    (run_with_timeout claude -p "$start_msg" --model "$CLAUDE_MODEL" --output-format json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
-  elif [[ "$cmd" == "gemini" ]]; then
-    (run_with_timeout gemini -p "$start_msg" -o json -m "$GEMINI_MODEL" 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
-  else
-    (run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$start_msg" --json 2>"$errfile" > "$outfile"; echo $? > "$exitfile") &
-  fi
+  (
+    local attempt=0
+    while true; do
+      local rc=0
+      if [[ "$cmd" == "claude" ]]; then
+        if run_with_timeout claude -p "$start_msg" --model "$CLAUDE_MODEL" --output-format json 2>"$errfile" > "$outfile"; then
+          rc=0
+        else
+          rc=$?
+        fi
+      elif [[ "$cmd" == "gemini" ]]; then
+        if run_with_timeout gemini -p "$start_msg" -o json -m "$GEMINI_MODEL" 2>"$errfile" > "$outfile"; then
+          rc=0
+        else
+          rc=$?
+        fi
+      else
+        if run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$start_msg" --json 2>"$errfile" > "$outfile"; then
+          rc=0
+        else
+          rc=$?
+        fi
+      fi
+      echo "$rc" > "$exitfile"
+
+      # Don't retry timeouts or success
+      [[ "$rc" == "0" ]] && break
+      [[ "$rc" == "124" ]] && break
+
+      # Check for rate limit in stderr or stdout
+      local is_rl=false
+      grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded" "$errfile" 2>/dev/null && is_rl=true
+      [[ "$is_rl" != true ]] && grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded" "$outfile" 2>/dev/null && is_rl=true
+      [[ "$is_rl" != true ]] && break
+
+      if [[ $attempt -ge $MAX_RETRIES ]]; then
+        echo "rate_limit_exhausted" > "$exitfile"
+        break
+      fi
+      attempt=$((attempt + 1))
+      local delay=$(( RETRY_BASE_DELAY * (1 << (attempt - 1)) ))
+      sleep "$delay"
+    done
+  ) &
   echo $!
 }
 
@@ -695,7 +826,9 @@ agent_a_exit=$(cat "$tmpdir/agent_a_r0_exit" 2>/dev/null || echo "1")
 agent_b_exit=$(cat "$tmpdir/agent_b_r0_exit" 2>/dev/null || echo "1")
 
 if [[ "$agent_a_exit" != "0" ]]; then
-  if [[ "$agent_a_exit" == "124" ]]; then
+  if [[ "$agent_a_exit" == "rate_limit_exhausted" ]]; then
+    echo "ERROR: $AGENT_A_NAME round 0 rate limited after $MAX_RETRIES retries" >&2
+  elif [[ "$agent_a_exit" == "124" ]]; then
     echo "ERROR: $AGENT_A_NAME round 0 timed out after ${API_TIMEOUT}s" >&2
   else
     echo "ERROR: $AGENT_A_NAME round 0 failed (exit $agent_a_exit): $(cat "$tmpdir/agent_a_r0_err" 2>/dev/null)" >&2
@@ -703,7 +836,9 @@ if [[ "$agent_a_exit" != "0" ]]; then
   exit 1
 fi
 if [[ "$agent_b_exit" != "0" ]]; then
-  if [[ "$agent_b_exit" == "124" ]]; then
+  if [[ "$agent_b_exit" == "rate_limit_exhausted" ]]; then
+    echo "ERROR: $AGENT_B_NAME round 0 rate limited after $MAX_RETRIES retries" >&2
+  elif [[ "$agent_b_exit" == "124" ]]; then
     echo "ERROR: $AGENT_B_NAME round 0 timed out after ${API_TIMEOUT}s" >&2
   else
     echo "ERROR: $AGENT_B_NAME round 0 failed (exit $agent_b_exit): $(cat "$tmpdir/agent_b_r0_err" 2>/dev/null)" >&2

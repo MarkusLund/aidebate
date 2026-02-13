@@ -16,7 +16,7 @@ bash ai-debate.sh "Your problem here"
 aidebate "Your problem here"
 
 # With options
-aidebate --max-rounds 4 --claude-model sonnet --codex-model gpt-5.2-codex "Your problem"
+aidebate --max-rounds 4 --max-retries 5 --claude-model sonnet --codex-model gpt-5.2-codex "Your problem"
 
 # Debug mode (keeps temp files, shows raw API responses)
 aidebate --debug "Your problem"
@@ -34,7 +34,7 @@ The entire application is a single bash script (`ai-debate.sh`). Key sections:
 
 5. **Transcript Recording (lines 330-370)**: JSON transcript export via `--output` flag with `transcript_add()` and `write_transcript()` functions.
 
-6. **API Calls (lines 390-470)**: `_call_agent()` handles all three backends with session resumption, JSON validation, and rate limit detection. Each backend has different JSON output formats:
+6. **API Calls (lines 390-470)**: `_call_agent()` handles all three backends with session resumption, JSON validation, and automatic retry with exponential backoff on rate limits (`--max-retries`, default 3). Each backend has different JSON output formats:
    - Claude: `{ session_id, result }`
    - Gemini: `{ session_id, response }`
    - Codex: NDJSON with `thread.started` and `item.completed` events

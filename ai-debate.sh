@@ -164,6 +164,31 @@ _is_rate_limited() {
   [[ -f "$file" ]] && grep -qiE "rate.?limit|too.?many.?requests|429|quota.?exceeded" "$file"
 }
 
+# Extract error details from stderr file or stdout
+# Usage: _extract_error_details err_file [raw_output]
+_extract_error_details() {
+  local err_file="$1"
+  local raw="${2:-}"
+  local err_msg=""
+
+  # Try stderr first
+  if [[ -f "$err_file" && -s "$err_file" ]]; then
+    err_msg=$(cat "$err_file")
+  # Try stdout as fallback
+  elif [[ -n "$raw" ]]; then
+    if echo "$raw" | grep -qiE "error|failed|exception|invalid|denied|unauthorized"; then
+      err_msg=$(echo "$raw" | grep -iE "error|failed|exception|invalid|denied|unauthorized" | head -3)
+    fi
+  fi
+
+  # Helpful fallback if still empty
+  if [[ -z "$err_msg" || "$err_msg" =~ ^[[:space:]]*$ ]]; then
+    err_msg="Command failed with no error output."
+  fi
+
+  echo "$err_msg"
+}
+
 # Dual spinner for Round 0 parallel execution
 DUAL_SPINNER_PID=""
 DUAL_SPINNER_AGENT_A=""
@@ -554,15 +579,22 @@ _call_agent() {
       if [[ -n "$session" ]]; then
         args+=(--resume "$session")
       fi
-      if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
-        local exit_code=$?
+      set +e
+      raw=$(run_with_timeout "${args[@]}" 2>"$err_file")
+      local exit_code=$?
+      set -e
+
+      if [[ $exit_code -ne 0 ]]; then
         if [[ $exit_code -eq 124 ]]; then
           echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
           return 1
         elif _is_rate_limited "$err_file"; then
           rate_limited=true
         else
-          echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+          local err_details
+          err_details=$(_extract_error_details "$err_file" "$raw")
+          echo "ERROR: $label API call failed (exit $exit_code): $err_details" >&2
+          [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
           return 1
         fi
       fi
@@ -594,15 +626,22 @@ _call_agent() {
       if [[ -n "$session" ]]; then
         args+=(--resume "$session")
       fi
-      if ! raw=$(run_with_timeout "${args[@]}" 2>"$err_file"); then
-        local exit_code=$?
+      set +e
+      raw=$(run_with_timeout "${args[@]}" 2>"$err_file")
+      local exit_code=$?
+      set -e
+
+      if [[ $exit_code -ne 0 ]]; then
         if [[ $exit_code -eq 124 ]]; then
           echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
           return 1
         elif _is_rate_limited "$err_file"; then
           rate_limited=true
         else
-          echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+          local err_details
+          err_details=$(_extract_error_details "$err_file" "$raw")
+          echo "ERROR: $label API call failed (exit $exit_code): $err_details" >&2
+          [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
           return 1
         fi
       fi
@@ -632,28 +671,42 @@ _call_agent() {
     else
       # codex
       if [[ -z "$session" ]]; then
-        if ! raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
-          local exit_code=$?
+        set +e
+        raw=$(run_with_timeout codex exec -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file")
+        local exit_code=$?
+        set -e
+
+        if [[ $exit_code -ne 0 ]]; then
           if [[ $exit_code -eq 124 ]]; then
             echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
             return 1
           elif _is_rate_limited "$err_file"; then
             rate_limited=true
           else
-            echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+            local err_details
+            err_details=$(_extract_error_details "$err_file" "$raw")
+            echo "ERROR: $label API call failed (exit $exit_code): $err_details" >&2
+            [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
             return 1
           fi
         fi
       else
-        if ! raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file"); then
-          local exit_code=$?
+        set +e
+        raw=$(run_with_timeout codex exec resume "$session" -m "$CODEX_MODEL" -c 'model_reasoning_effort="medium"' "$msg" --json 2>"$err_file")
+        local exit_code=$?
+        set -e
+
+        if [[ $exit_code -ne 0 ]]; then
           if [[ $exit_code -eq 124 ]]; then
             echo "ERROR: $label API call timed out after ${API_TIMEOUT}s" >&2
             return 1
           elif _is_rate_limited "$err_file"; then
             rate_limited=true
           else
-            echo "ERROR: $label API call failed (exit $exit_code): $(cat "$err_file")" >&2
+            local err_details
+            err_details=$(_extract_error_details "$err_file" "$raw")
+            echo "ERROR: $label API call failed (exit $exit_code): $err_details" >&2
+            [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
             return 1
           fi
         fi
@@ -831,7 +884,10 @@ if [[ "$agent_a_exit" != "0" ]]; then
   elif [[ "$agent_a_exit" == "124" ]]; then
     echo "ERROR: $AGENT_A_NAME round 0 timed out after ${API_TIMEOUT}s" >&2
   else
-    echo "ERROR: $AGENT_A_NAME round 0 failed (exit $agent_a_exit): $(cat "$tmpdir/agent_a_r0_err" 2>/dev/null)" >&2
+    local err_details
+    err_details=$(_extract_error_details "$tmpdir/agent_a_r0_err" "$(cat "$tmpdir/agent_a_raw" 2>/dev/null || true)")
+    echo "ERROR: $AGENT_A_NAME round 0 failed (exit $agent_a_exit): $err_details" >&2
+    [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
   fi
   exit 1
 fi
@@ -841,7 +897,10 @@ if [[ "$agent_b_exit" != "0" ]]; then
   elif [[ "$agent_b_exit" == "124" ]]; then
     echo "ERROR: $AGENT_B_NAME round 0 timed out after ${API_TIMEOUT}s" >&2
   else
-    echo "ERROR: $AGENT_B_NAME round 0 failed (exit $agent_b_exit): $(cat "$tmpdir/agent_b_r0_err" 2>/dev/null)" >&2
+    local err_details
+    err_details=$(_extract_error_details "$tmpdir/agent_b_r0_err" "$(cat "$tmpdir/agent_b_raw" 2>/dev/null || true)")
+    echo "ERROR: $AGENT_B_NAME round 0 failed (exit $agent_b_exit): $err_details" >&2
+    [[ "$DEBUG" != true ]] && echo -e "${GRAY}Hint: Re-run with --debug to inspect raw output${NC}" >&2
   fi
   exit 1
 fi
